@@ -3223,9 +3223,7 @@ mod tests {
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
         const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants = 1, b0)"
 cbuffer Drawn : register(b0) { uint number; };
-[RootSignature(RS)]
 float4 corner(uint i : SV_VertexID) : SV_Position {
     float z = float(number) * asfloat(0x37800080);
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, z, 1.0);
@@ -3244,8 +3242,11 @@ float4 lit() : SV_Target { return 1.0; }
         formats[0] = DXGI_FORMAT(61);
         // SAFETY: plain creation; the description points at live data.
         let (signature, pipeline) = unsafe {
-            let signature: ID3D12RootSignature =
-                host.device.CreateRootSignature(0, &vs[..]).unwrap();
+            let signature = crate::host::root_signature_from_params(
+                &host.device,
+                &[crate::host::root_param_constants(0, 1)],
+            )
+            .unwrap();
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&signature),
                 VS: code(&vs[..]),
