@@ -682,6 +682,53 @@ mod tests {
         }
     }
 
+    /// Putting bytes back writes every writable page of the range and only
+    /// those: a page not mapped, not writable or guarded keeps what it has
+    /// (a guard stays), however the range lies over it.
+    #[test]
+    fn writes_back_only_writable_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        let from: Vec<u8> = (0..3 * PAGE).map(|i| (i * 7 + i / 251 + 1) as u8).collect();
+        for hole in [PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE | PAGE_GUARD, 0] {
+            for (start, len) in [(0, 3 * PAGE), (100, PAGE), (PAGE - 16, 32), (PAGE + 9, 50),
+                (2 * PAGE - 1, 2), (5, PAGE - 5)]
+            {
+                // SAFETY: three pages of ours; the middle one changes only
+                // through the calls here, and is read only while readable.
+                unsafe {
+                    let at = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT,
+                        PAGE_READWRITE).cast::<u8>();
+                    assert!(!at.is_null());
+                    at.write_bytes(0xee, 3 * PAGE);
+                    let middle = at.add(PAGE).cast();
+                    let mut old = 0;
+                    if hole == 0 {
+                        assert_ne!(VirtualFree(middle, PAGE, MEM_DECOMMIT), 0);
+                    } else {
+                        assert_ne!(VirtualProtect(middle, PAGE, hole, &mut old), 0);
+                    }
+                    write_mapped(at.add(start), from.as_ptr().add(start), len);
+                    if hole != 0 {
+                        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                        assert_ne!(VirtualQuery(middle, &mut info, size_of_val(&info)), 0);
+                        assert_eq!(info.Protect, hole, "{hole:#x} {start}+{len}");
+                        assert_ne!(VirtualProtect(middle, PAGE, PAGE_READWRITE, &mut old), 0);
+                    }
+                    for i in (0..PAGE).chain(2 * PAGE..3 * PAGE) {
+                        let want = if (start..start + len).contains(&i) { from[i] } else { 0xee };
+                        assert_eq!(*at.add(i), want, "{hole:#x} {start}+{len} at {i}");
+                    }
+                    if hole != 0 {
+                        let middle = std::slice::from_raw_parts(at.add(PAGE), PAGE);
+                        assert!(middle.iter().all(|&b| b == 0xee), "{hole:#x} {start}+{len}");
+                    }
+                    assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -5588,11 +5635,33 @@ fn direct_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// Whether title memory is written in user mode first ([`crate::title_copy`])
+/// and through the kernel only where that faults. Under Wine the kernel's
+/// write goes through the wineserver, data and all: 1.4 GB/s, 17 us for a
+/// 4 KiB piece, against 2.7 GB/s (write-watched memory) to 8 GB/s in user
+/// mode (`title_write_bench`); putting back what shaders wrote was 48 ms a
+/// frame for 1,100 pieces (run 1124-173930). On by default;
+/// `VICTORY_USER_WRITES=0` writes through the kernel only.
+fn user_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_USER_WRITES").is_none_or(|v| v != "0"))
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// In user mode the write lands where the kernel's would: a page that is
+/// not mapped or not writable (a guard of [`crate::watch`] the caller did
+/// not open, a title guard page, which is put back) faults, and the kernel
+/// then writes what it can, as before. Write watching counts both alike.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: the source is our host copy of `len` bytes; a fault on the
+    // destination makes the copy return false.
+    if len == 0 || (user_writes() && unsafe { crate::title_copy::copy(dst, src, len) }) {
+        return;
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);

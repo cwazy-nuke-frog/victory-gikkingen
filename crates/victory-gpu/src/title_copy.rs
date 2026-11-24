@@ -95,7 +95,10 @@ unsafe extern "win64" {
 ///
 /// # Safety
 ///
-/// `dst` is `len` bytes the caller may write. `src` may be any address.
+/// Writing `dst`'s `len` bytes, where they are mapped and writable, is the
+/// caller's to do (its own memory, or title memory it puts bytes back
+/// into); either may be not mapped or not accessible. `src` may be any
+/// address.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     install();
     // SAFETY: the caller's; a fault in the routine makes it return 0.
@@ -118,7 +121,7 @@ fn recover(code: NTSTATUS, rip: usize) -> Option<usize> {
         .then_some(&raw const victory_title_copy_failed as usize)
 }
 
-/// Makes the page of `at`, whose guard our read just spent, a guard page
+/// Makes the page of `at`, whose guard our copy just spent, a guard page
 /// again: the kernel's copy leaves guards alone, and they are the title's.
 ///
 /// Between the fault and this, a title thread that touches the page is not
@@ -573,6 +576,90 @@ mod tests {
             println!("a failing copy, {what}: {each} ns");
         }
         free(heap);
+        free(src);
+    }
+
+    /// Writes of host memory into title-like memory: through the kernel
+    /// (`NtWriteVirtualMemory`, what `host::write_mapped` does) and in user
+    /// mode, into plain and into write-watched memory (whose pages are made
+    /// clean before each pass, as the title's are between frames). Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture title_write_bench`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn title_write_bench() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        #[link(name = "ntdll", kind = "raw-dylib")]
+        unsafe extern "system" {
+            fn NtWriteVirtualMemory(
+                process: *mut std::ffi::c_void,
+                base: *mut std::ffi::c_void,
+                buffer: *const std::ffi::c_void,
+                size: usize,
+                written: *mut usize,
+            ) -> i32;
+        }
+        let kernel_write = |dst: *mut u8, src: *const u8, len: usize| {
+            let mut done = 0;
+            // SAFETY: both ranges are ours.
+            unsafe {
+                NtWriteVirtualMemory(GetCurrentProcess(), dst.cast(), src.cast(), len, &mut done)
+                    >= 0
+            }
+        };
+        const ROOM: usize = 64 << 20;
+        let src = pages(ROOM / PAGE);
+        for watched in [false, true] {
+            // SAFETY: a fresh allocation.
+            let dst = unsafe {
+                let flags = MEM_RESERVE | MEM_COMMIT | if watched { MEM_WRITE_WATCH } else { 0 };
+                VirtualAlloc(std::ptr::null(), ROOM, flags, PAGE_READWRITE).cast::<u8>()
+            };
+            assert!(!dst.is_null());
+            // SAFETY: touch every page once.
+            unsafe { dst.write_bytes(1, ROOM) };
+            let mut found = vec![0usize; ROOM / PAGE];
+            let reset = || {
+                if watched {
+                    let (mut count, mut granularity) = (found.len(), 0u32);
+                    // SAFETY: the answer has room for every page.
+                    let r = unsafe {
+                        GetWriteWatch(1, dst.cast(), ROOM, found.as_ptr() as *mut _, &mut count,
+                            &mut granularity)
+                    };
+                    assert_eq!(r, 0);
+                }
+            };
+            for shift in [12, 15, 18, 20, 22] {
+                let len = 1usize << shift;
+                let n = ROOM / len;
+                let measure = |f: &dyn Fn(*mut u8, *const u8) -> bool| {
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        reset();
+                        let started = std::time::Instant::now();
+                        for i in 0..n {
+                            let at = i * len;
+                            assert!(f(dst.wrapping_add(at), black_box(src.wrapping_add(at))));
+                        }
+                        best = best.min(started.elapsed().as_secs_f64());
+                    }
+                    best
+                };
+                let before = measure(&|d, s| kernel_write(d, s, len));
+                // SAFETY: both ranges are inside their buffers.
+                let after = measure(&|d, s| unsafe { copy(d, s, len) });
+                let gbs = |t: f64| ROOM as f64 / t / 1e9;
+                println!(
+                    "{}, {len:>8} B pieces: kernel {:>6.2} GB/s ({:>7.1} us each), user {:>6.2} GB/s ({:>7.1} us each), {:.1}x",
+                    if watched { "write-watched" } else { "plain" },
+                    gbs(before), before / n as f64 * 1e6,
+                    gbs(after), after / n as f64 * 1e6,
+                    before / after
+                );
+            }
+            free(dst);
+        }
         free(src);
     }
 }
