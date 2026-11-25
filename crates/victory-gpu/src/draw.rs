@@ -862,6 +862,12 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        // A draw or dispatch whose stages store may have written indirect
+        // arguments: a run of indirect draws whose clamps go to the list
+        // before it (`crate::list`) ends at these.
+        if crate::indirect::hoist_mode() != 0 && p.stages.iter().any(|stage| stage.translated().stores) {
+            list.count_write();
+        }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
@@ -2038,6 +2044,11 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        // And the arguments of later indirect draws: a run whose clamps go
+        // to the list before it (`crate::list`) ends at dispatches.
+        if crate::indirect::hoist_mode() != 0 {
+            list.count_write();
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2348,6 +2359,11 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        // The drawing state changed: a run of indirect draws whose clamps
+        // go to the list before it (`crate::list`) ends at these too.
+        if crate::indirect::hoist_mode() != 0 {
+            list.count_write();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2884,6 +2900,7 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
+        before: Option<&HostList>,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
@@ -2973,6 +2990,15 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // The clamps of a run of indirect draws go to a list of their own,
+        // recorded before the one that draws (`crate::list`'s cut at the
+        // run's first draw): no dispatch or state change of ours comes
+        // between the draws. Only draws whose shaders store to no buffer
+        // join a run: those may write the arguments of the draws after
+        // them, and an indirect dispatch runs compute anyway.
+        let runs =
+            kind != DISPATCH && !p.stages.iter().any(|stage| stage.translated().stores);
+        let hoisted = (before.is_some() && runs).then_some(before).flatten();
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -2980,13 +3006,12 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
-            && kind != DISPATCH
+            && runs
             && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+            && count.is_none();
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
+        if !windowed || list.first_use(WINDOW_USE) || hoisted.is_some() {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
@@ -2996,7 +3021,27 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
+        // A hoisted run clamps its records where the run's clamps go; the
+        // arguments and the count buffer are refreshed on the list that
+        // clamps them, so that its own pass brings them up to date before
+        // it runs.
+        let hoisted = hoisted.and_then(|clamps| {
+            args.refresh(clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(clamps, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            crate::indirect::bound_before(
+                clamps,
+                (&args.buffer, offset),
+                count_arg,
+                (kind, stride, max),
+            )
+        });
+        let inline = hoisted.is_none();
+        let (bounded, at) = match hoisted {
+            Some((buffer, at)) => (buffer, at),
+            None => match hit {
             Some((scratch, at, step)) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -3056,9 +3101,13 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
+                // Only the inline clamp dirtied the list's compute state:
+                // the run's clamps went to the list before.
+                if inline {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                self.window = (windowed && inline).then(|| Window {
                     copy: args.id(),
                     kind,
                     stride,
@@ -3068,7 +3117,7 @@ impl State {
                     scratch: bounded.clone(),
                 });
                 (bounded, 0)
-            }
+            } }
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
@@ -3105,6 +3154,12 @@ impl State {
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
+        // An indirect dispatch runs compute: it may have written the
+        // arguments of the draws after it, so a run of indirect draws ends
+        // at it.
+        if kind == DISPATCH && crate::indirect::hoist_mode() != 0 {
+            list.count_write();
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

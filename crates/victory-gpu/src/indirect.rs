@@ -405,6 +405,126 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// How the clamps of a run of indirect draws are recorded
+/// (`crate::list` cuts the recording so the run's clamps go into a list of
+/// their own, executed before the one that draws):
+/// `VICTORY_HOIST_CLAMPS` sets it; 0, the default, records each clamp
+/// before its draw, as before. 1 hoists, running the clamps of a pass
+/// concurrently. 7 hoists with a barrier between the clamps, so that the
+/// budget is charged in the order of the draws, as it is when each clamp
+/// runs before its own draw; without it the records that run empty past the
+/// list's budget differ from frame to frame, and whole mesh objects
+/// flickered (leaves, chairs, clothes).
+pub(crate) fn hoist_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// [`bound`] for a call of a run whose clamps go to `clamps`, a list
+/// executed before the one that draws (`crate::list`'s hoist): the records
+/// are clamped into `clamps`'s own buffers ([`HostList::clamp_room`]), at an
+/// offset the drawing list reads its record at, with no transition or wait
+/// of our own between the draws — the pass's buffers are turned into
+/// `INDIRECT_ARGUMENT` once, at [`HostList::clamp_end`]. `None` (and the
+/// caller clamps inline, as before) if the room, the clamp or the alignment
+/// is not had.
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let c = clamp()?;
+    let (_, _, records) = spec;
+    if records == 0 {
+        return None;
+    }
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    record_clamp_before(c, clamps, src, count, spec, bytes)
+}
+
+/// The clamp of [`bound_before`], recorded where the clamps of a pass go:
+/// the records are clamped into `clamps`'s own buffers ([`HostList::clamp_room`],
+/// already `UNORDERED_ACCESS`, the pass's one opening barrier recorded with
+/// the first room), at an offset the drawing list reads its record at; the
+/// budget is the clamps list's. In mode 7 a barrier follows each clamp so the
+/// budget is charged in the order of the draws. No state change of the
+/// clamped rooms here: the pass keeps them writable until
+/// [`HostList::clamp_end`] gives them to the drawing list.
+fn record_clamp_before(
+    c: &Clamp,
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    bytes: u64,
+) -> Option<(ID3D12Resource, u64)> {
+    // SAFETY: live D3D12 buffer resources.
+    let src_base = unsafe { src.GetGPUVirtualAddress() };
+    if !src_base.is_multiple_of(4) {
+        return None;
+    }
+    // Addresses the shader's 32-bit offsets reach, as in `record_clamp_as`.
+    let fits = |offset: u64, len: u64| {
+        offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match count {
+        Some((buf, off)) => {
+            // SAFETY: a live D3D12 buffer resource.
+            let base = unsafe { buf.GetGPUVirtualAddress() };
+            if !base.is_multiple_of(4) {
+                return None;
+            }
+            if fits(off, 4) {
+                (base, 1u32, off as u32)
+            } else {
+                (base.checked_add(off)?, 1, 0)
+            }
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    let budget = clamps.budget()?;
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer made writable by `clamp_room`.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    // SAFETY: an open clamps list; our root signature and pipeline; live
+    // source, count, room and budget buffers. The room was made
+    // `UNORDERED_ACCESS` when it was given; `src` and `count` stay in
+    // `COMMON` / `GENERIC_READ` via implicit buffer promotion.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        if records > 0 {
+            l.Dispatch(records.div_ceil(64), 1, 1);
+        }
+        // Mode 7: one clamp after another, so that the budget is charged in
+        // the order of the draws, as it is when each clamp precedes its own.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.

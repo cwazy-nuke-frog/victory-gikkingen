@@ -889,6 +889,13 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// Dispatches and buffer copies recorded since the reset: what may have
+    /// written indirect arguments ([`crate::indirect`] clamps hoisted into a
+    /// list before the one that draws them end at these).
+    writes: std::sync::atomic::AtomicU64,
+    /// Buffers of clamped indirect arguments while this list holds the clamps
+    /// of the list after it ([`HostList::clamp_room`]).
+    clamp_chunks: Mutex<ClampChunks>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -906,6 +913,18 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// A list's buffers of the clamped indirect arguments of the list after it
+/// ([`HostList::clamp_room`]): whole buffers with the resource state this
+/// list tracks them in, the slice of each in use, and whether the pass's
+/// one opening barrier (what earlier lists' shaders wrote) is recorded.
+#[derive(Default)]
+struct ClampChunks {
+    all: Vec<(ID3D12Resource, i32)>,
+    used: usize,
+    at: u64,
+    barrier: bool,
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -4095,6 +4114,8 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                clamp_chunks: Mutex::default(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
@@ -6379,6 +6400,14 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            // A new pass starts: the buffers stay, their rooms empty.
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7121,6 +7150,93 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// A dispatch or a buffer copy recorded in the list: what may have
+    /// written indirect arguments. A run of indirect draws whose clamps go
+    /// to the list before it (`crate::list`) ends at these.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches and buffer copies recorded since the reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Room for `bytes` of clamped indirect arguments in this list's buffers,
+    /// writable by the clamp of the pass: `(buffer, offset)`, the offset the
+    /// drawing list reads its record at. Whole buffers are taken as the pass
+    /// needs them; `None` for more than one holds. The pass's first room
+    /// records its one opening barrier — what earlier lists' shaders wrote
+    /// first — and the buffers end the pass in `INDIRECT_ARGUMENT`
+    /// ([`clamp_end`]): there is no transition or wait of our own between
+    /// the clamps of a pass.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const CHUNK: u64 = 256 << 10;
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > CHUNK {
+            return None;
+        }
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let at = chunks.at;
+            chunks.at += bytes;
+            return Some((chunks.all[chunks.used - 1].0.clone(), at));
+        }
+        if chunks.used == chunks.all.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".into());
+            chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON.0));
+        }
+        let i = chunks.used;
+        chunks.used += 1;
+        chunks.at = bytes;
+        let mut barriers = Vec::new();
+        if !chunks.barrier {
+            // What earlier lists' shaders wrote first.
+            chunks.barrier = true;
+            barriers.push(D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            });
+        }
+        let (buffer, state) = &mut chunks.all[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 {
+            barriers.push(transition(buffer, D3D12_RESOURCE_STATES(*state), D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0;
+        }
+        let buffer = buffer.clone();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers; the barrier's resource
+            // is whole-list and the buffers are the list's own.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        Some((buffer, 0))
+    }
+
+    /// The rooms the pass wrote so far become readable as indirect arguments
+    /// by the lists after this one: the pass's end.
+    pub(crate) fn clamp_end(&self) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let used = chunks.used;
+        let barriers: Vec<_> = chunks.all[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0;
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers; the buffers are the
+            // list's own.
+            unsafe { self.list.ResourceBarrier(&barriers) };
         }
     }
 

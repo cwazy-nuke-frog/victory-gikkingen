@@ -127,6 +127,25 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// A run of indirect draws is being recorded: their clamps go to the
+    /// list before the one that draws ([`hoisted`]).
+    #[cfg(windows)]
+    hoist: Option<Hoisted>,
+}
+
+/// A run of indirect draws' clamps ([`List::hoist`]): the list they go to
+/// (executed before the one that draws), the drawing list it runs before,
+/// and that list's dispatches and copies when the run began. A run ends
+/// when those change: what the drawing list recorded since may have
+/// written the arguments the clamps read.
+#[cfg(windows)]
+struct Hoisted {
+    clamps: crate::host::HostList,
+    into: usize,
+    writes: u64,
+    /// The list was untouched when it became the clamps': the waits the
+    /// queue stands at belong to it.
+    gate: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -310,6 +329,9 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    // The clamps run the recording opened end with it: they come before
+    // the part the cut closes.
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -341,6 +363,99 @@ fn cut(this: This, wait: ValueWait) {
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
     }
+}
+
+/// Ends the clamps run a list is recording, if any ([`hoisted`]): the
+/// clamped rooms become readable as indirect arguments and the clamps list
+/// is closed, as a part that runs before the drawing list that goes on
+/// recording.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    if let Some(h) = list.hoist.take() {
+        h.clamps.clamp_end();
+        h.clamps.close();
+        let waits = if h.gate {
+            std::mem::take(&mut list.gate)
+        } else {
+            Vec::new()
+        };
+        list.earlier.push(Part { waits, host: h.clamps });
+    }
+}
+
+/// The clamps of the run of indirect draws the title is recording in `this`
+/// go to the list before it, opened (or reused) here: the clamps list, for
+/// the drawing walk's use. Unless the recording already has such a list and
+/// nothing that may have written the arguments has been recorded in the
+/// drawing list since, the recording is cut — everything recorded so far
+/// keeps its place and runs before the clamps, and the recording goes on in
+/// another list after them — so the arguments the clamps read are those the
+/// recording so far wrote. `None` (and the clamp goes before its draw, as
+/// before) if there is no host list to spare or the host has none at all.
+#[cfg(windows)]
+fn hoisted<'a>(this: This, kind: u32) -> Option<&'a crate::host::HostList> {
+    const DISPATCH: u32 = 2;
+    if crate::indirect::hoist_mode() == 0 || kind == DISPATCH {
+        return None;
+    }
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no submission takes it while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let (current, untouched) = {
+        let Some(current) = list.host.as_ref() else {
+            return None;
+        };
+        (std::ptr::from_ref(current) as usize, current.untouched())
+    };
+    if let Some(h) = list.hoist.as_ref()
+        && h.into == current
+        && h.writes == unsafe { (*this.cast::<List>()).host.as_ref().unwrap().writes() }
+    {
+        // SAFETY: the pass stays open until this recording is cut short,
+        // and nothing else touches the list while it records.
+        return unsafe { (*this.cast::<List>()).hoist.as_ref().map(|h| &h.clamps) };
+    }
+    end_hoist(list);
+    // The recording so far keeps its place: the clamps follow it, and the
+    // recording goes on in another list after them.
+    let (clamps, gate) = if untouched {
+        // Nothing was recorded: the list itself holds the clamps, and the
+        // recording goes on in another (the state set in it does them no
+        // harm); the waits the queue stands at belong to it.
+        let fresh = fresh_list()?;
+        (list.host.replace(fresh)?, true)
+    } else {
+        // The spares first: a failed one leaves the recording untouched,
+        // and its clamp goes before its draw, as before.
+        let clamps = fresh_list()?;
+        let fresh = fresh_list()?;
+        list.host.as_ref()?.close();
+        let done = list.host.replace(fresh)?;
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: done });
+        (clamps, false)
+    };
+    let (into, writes) = {
+        let Some(into) = list.host.as_ref() else {
+            return None;
+        };
+        (std::ptr::from_ref(into) as usize, into.writes())
+    };
+    // What the title set so far, on the list the recording goes on in.
+    if let Some(host) = list.host.as_ref() {
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replay(host);
+    }
+    static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(parts = list.earlier.len() + 2, "the clamps of a run of indirect draws hoisted over it");
+    }
+    list.hoist = Some(Hoisted { clamps, into, writes, gate });
+    // SAFETY: the pass was just opened, and nothing else touches the list
+    // while it records.
+    unsafe { (*this.cast::<List>()).hoist.as_ref().map(|h| &h.clamps) }
 }
 
 /// Whether list `this` recorded a wait for a memory value (with waits cut
@@ -403,6 +518,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -476,6 +592,13 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
+            // A submitted list is closed; nothing should be hoisted over it
+            // still — if it is, its clamps are recorded but will not run.
+            if (*list).hoist.is_some() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("a list submitted while its hoisted clamps were open"));
+                end_hoist(&mut *list);
+            }
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
@@ -596,6 +719,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        hoist: None,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -626,8 +751,14 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.close();
+    {
+        // The clamps run the recording ends with it.
+        // SAFETY: the title passes one of our lists, recorded and closed
+        // on one thread.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+        if let Some(host) = host_list(this) {
+            host.close();
+        }
     }
     S_OK
 }
@@ -651,6 +782,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         list.earlier.clear();
         list.gate.clear();
     }
@@ -826,6 +958,9 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        // A copy may write the arguments of later indirect draws: a run
+        // whose clamps go to the list before it (`crate::list`) ends here.
+        list.count_write();
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -858,6 +993,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        // A copy may write the arguments of later indirect draws: a run
+        // whose clamps go to the list before it (`crate::list`) ends here.
+        list.count_write();
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1356,6 +1494,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        list.count_write();
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1757,8 +1896,11 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        // The clamps of the run this draw is in, hoisted over it by the
+        // cut it opened (or reused), if the switch is on.
+        let before = hoisted(this, kind);
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, before, (kind, stride, max), address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
