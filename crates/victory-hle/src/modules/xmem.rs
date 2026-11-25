@@ -394,6 +394,43 @@ impl Physical {
     }
 }
 
+impl Slice {
+    /// The key of page `k` of the slices from this one on in [`Physical::shown`].
+    fn key(&self, k: usize) -> (usize, usize) {
+        (Arc::as_ptr(&self.section) as usize, self.index + k)
+    }
+}
+
+/// Every address of a title view showing a page that title memory at
+/// `[at, at + len)` shows, except the page's own address: pushed to `out`
+/// as (page address, other address). The GPU side guards the pairs and
+/// marks a write at any of them everywhere it is watched
+/// (`victory_gpu::use_alias_resolver`); `VICTORY_ALIAS_NOTIFY=0` asks
+/// nothing, as before.
+pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+    let physical = physical();
+    let end = at.saturating_add(len);
+    let first = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| *base + size > at)
+        .map(|(base, _)| *base);
+    let starts = first
+        .into_iter()
+        .chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
+    for base in starts.collect::<Vec<_>>() {
+        let (size, slice) = &physical.views[&base];
+        let (from, to) = (at.max(base), end.min(base + size));
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let k = (page - base) / PAGE;
+            if let Some(addresses) = physical.shown.get(&slice.key(k)) {
+                out.extend(addresses.iter().filter(|&&a| a != page).map(|&a| (page, a)));
+            }
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
@@ -866,6 +903,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    // Pages shown at views the title already has: a write through the new
+    // mapping is a write through those too, which the GPU side follows only
+    // if it is told, before its views forget their own views of the pages
+    // (`note_shown`).
+    for k in 0..len.div_ceil(PAGE) {
+        if let Some(others) = physical.shown.get(&slice.key(k)) {
+            victory_gpu::title_memory_aliased(base + k * PAGE, others);
+        }
+    }
     physical.note_shown(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
@@ -1557,6 +1603,44 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
         }
         assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn pages_say_their_aliases() {
+        let pages = allocate(3);
+        let at = |p: usize| p as *mut c_void;
+        let flags = MEM_RESERVE | PAGES_64K;
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, flags, 0, PAGE_READWRITE) as usize;
+        let b = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, flags, 0, PAGE_READWRITE) as usize;
+        let others = |at: usize, len: usize| {
+            let mut out = Vec::new();
+            aliases(at, len, &mut out);
+            out.sort_unstable();
+            out
+        };
+        assert!(others(a, 3 * PAGE).is_empty(), "mapped nowhere");
+        // All three at `a`; the last two at `b`, from its second page on.
+        assert_eq!(XMemMapPhysicalPages(at(a), 3, pages.as_ptr()) as usize, a);
+        let second = b + PAGE;
+        assert_eq!(
+            XMemMapPhysicalPages(at(second), 2, pages[1..].as_ptr()) as usize,
+            second
+        );
+        assert_eq!(others(a, PAGE), vec![], "shown once");
+        assert_eq!(others(a + PAGE, PAGE), vec![(a + PAGE, second)]);
+        assert_eq!(others(second, PAGE), vec![(second, a + PAGE)]);
+        assert_eq!(
+            others(second, 2 * PAGE),
+            vec![(second, a + PAGE), (second, a + 2 * PAGE)]
+        );
+        // A byte range speaks of its whole page.
+        assert_eq!(others(a + 2 * PAGE + 1, 1), vec![(a + 2 * PAGE, second + PAGE)]);
+        // Unmapped views are forgotten.
+        assert_eq!(XMemMapPhysicalPages(at(second), 2, std::ptr::null()) as usize, second);
+        assert_eq!(others(a, 3 * PAGE), vec![], "shown once again");
+        assert_eq!(XMemMapPhysicalPages(at(a), 3, std::ptr::null()) as usize, a);
+        assert!(others(a, 3 * PAGE).is_empty());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 

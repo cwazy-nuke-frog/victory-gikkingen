@@ -464,6 +464,7 @@ fn work(scheduler: &'static Scheduler) {
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
+        notify_summary();
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -1056,6 +1057,31 @@ fn into_destination(
 /// written, and the bytes at those addresses, since the last debug summary
 /// ([`pages_written`]).
 static SHOWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Says once a minute whether the notifications fire ([`pages_written`],
+/// the GPU side's alias follow) — a trial runs INFO, which the DEBUG
+/// summary every 5 s does not reach: whether either of them ever fires is
+/// the first question of one. `VICTORY_ALIAS_NOTIFY=0` and
+/// `VICTORY_DSTORAGE_SHOWN=0` leave both columns at zero.
+fn notify_summary() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.try_lock() else {
+        return;
+    };
+    if last.as_ref().is_some_and(|t| t.elapsed().as_secs() < 60) {
+        return;
+    }
+    last.get_or_insert_with(std::time::Instant::now);
+    let [guards, marks, maps] = victory_gpu::alias_counters();
+    tracing::info!(
+        shown_requests = SHOWN[0].swap(0, Ordering::Relaxed),
+        shown_mb = SHOWN[1].swap(0, Ordering::Relaxed) >> 20,
+        alias_guards = guards,
+        alias_marks = marks,
+        alias_maps = maps,
+        "dstorage: notifications of title writes since the last minute"
+    );
+}
 
 /// Bytes `[offset, offset + len)` of physical pages were written through a
 /// view of our own: where the title has those pages mapped, the GPU side is

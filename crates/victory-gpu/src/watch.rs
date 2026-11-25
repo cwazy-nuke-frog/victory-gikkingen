@@ -379,13 +379,52 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks of title memory showing the same physical pages as another
+    /// block, both ways, as the runtime told when the pairs last changed:
+    /// a write through one of a copy's guarded pages' other mappings must
+    /// not stay unseen by that copy (`VICTORY_ALIAS_NOTIFY=0`: as before).
+    alias_of: BTreeMap<usize, Vec<usize>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    alias_of: BTreeMap::new(),
 });
+
+/// Whether a write through one mapping of title pages marks every copy
+/// that watches their other mappings; on ([`Guards::alias_of`]) unless
+/// `VICTORY_ALIAS_NOTIFY=0`.
+fn aliases_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_NOTIFY").is_none_or(|v| v != "0"))
+}
+
+/// The runtime's (`xmem`) answer to "which other title addresses show the
+/// same pages as `[at, at + len)`", registered at device creation
+/// ([`victory_gpu::use_alias_resolver`]): (page address, other address).
+pub type AliasResolver = fn(usize, usize, &mut Vec<(usize, usize)>);
+
+static RESOLVER: std::sync::OnceLock<AliasResolver> = std::sync::OnceLock::new();
+
+/// The runtime tells where else title memory is mapped (`xmem::aliases`).
+pub fn use_alias_resolver(resolver: AliasResolver) {
+    let _ = RESOLVER.set(resolver);
+}
+
+/// Blocks guarded or marked written through their other mappings since the
+/// last run-summary line that took them (`alias_counters`), and mappings
+/// the runtime told aliased.
+static ALIAS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The alias counters (`Guards::alias_of`'s work) since the last asking:
+/// blocks guarded at their other mappings, blocks marked written through
+/// one, and mappings the runtime told aliased. Reset by the run summary.
+pub fn alias_counters() -> [u64; 3] {
+    std::array::from_fn(|i| ALIAS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -415,6 +454,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
+    // The blocks protected below, whose other mappings are guarded too
+    // (after the lock, which the resolver must not wait for).
+    let mut newly: Vec<usize> = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
@@ -457,9 +499,64 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
+            newly.extend(from..block);
         }
     }
+    drop(g);
+    guard_aliases(&newly);
     Some(written)
+}
+
+/// Guards the other mappings of the freshly guarded blocks ([`guard`]):
+/// a write through one of them faults here as through the guarded one
+/// itself, and the pairs are noted both ways ([`Guards::alias_of`]).
+/// Asked without the guard lock — the runtime's own is under ours —, in
+/// the blocks' runs, only for the aliased ([`aliases_on`]).
+fn guard_aliases(newly: &[usize]) {
+    let Some(resolve) = RESOLVER.get().copied().filter(|_| aliases_on()) else {
+        return;
+    };
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < newly.len() {
+        // A run of consecutive blocks just guarded: at most one question.
+        let first = i;
+        while i + 1 < newly.len() && newly[i + 1] == newly[i] + 1 {
+            i += 1;
+        }
+        resolve(
+            newly[first] * BLOCK,
+            (newly[i] + 1 - newly[first]) * BLOCK,
+            &mut pairs,
+        );
+        i += 1;
+    }
+    let pairs: Vec<(usize, usize)> = pairs.into_iter().map(|(p, o)| (p / BLOCK, o / BLOCK)).collect();
+    if pairs.is_empty() {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut g = guards();
+    for &(block, other) in &pairs {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes (failing
+        // harmlessly if what showed the pages is unmapped since).
+        let guarded = unsafe {
+            VirtualProtect((other * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) != 0
+        };
+        // Guarding a block already watched keeps what its watchers know of
+        // it: a mark sitting on it stays (`writing`'s, the fault handler's).
+        if guarded && g.protected.insert(other) {
+            g.clean.insert(other);
+            ALIAS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for (a, b) in [(block, other), (other, block)] {
+            let links = g.alias_of.entry(a).or_default();
+            if !links.contains(&b) {
+                links.push(b);
+            }
+        }
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -584,6 +681,17 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    // Linked blocks are written too ([`marked`]): only guarded ones are
+    // ever linked, so a range nothing guards costs one read.
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let mut marks = 0;
+    for block in g.alias_of.range(range).map(|(&b, _)| b).collect::<Vec<_>>() {
+        marks += marked(&mut g, block);
+    }
+    if marks > 0 {
+        ALIAS[1].fetch_add(marks as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -803,10 +911,74 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let linked: Vec<usize> = g.alias_of.range(range).map(|(&b, _)| b).collect();
+    for block in linked {
+        g.alias_of.remove(&block);
+    }
+}
+
+/// Tells the other mappings of the pages a write reaches: taken by the
+/// fault handler and [`writing`], under the guard lock. [`Guards::alias_of`]
+/// holds pairs of guarded blocks only, so a write's range is read off its
+/// keys, not the runtime's answer asked anew.
+fn marked(g: &mut Guards, block: usize) -> usize {
+    let Some(others) = g.alias_of.get(&block) else {
+        return 0;
+    };
+    let mut marked = 0;
+    for other in others.clone() {
+        if g.clean.remove(&other) {
+            marked += 1;
+        }
+    }
+    marked
+}
+
+/// The runtime mapped the pages at `at` where `others` show them already:
+/// if one of those is guarded, the new mapping is guarded too, and linked
+/// with them, so a write through any of the mappings is seen by every
+/// copy watching one. `VICTORY_ALIAS_NOTIFY=0`: nothing, as before.
+pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    if !aliases_on() {
+        return;
+    }
+    ALIAS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut g = guards();
+    let held: Vec<usize> = others
+        .iter()
+        .map(|&o| o / BLOCK)
+        .filter(|o| g.protected.contains(o))
+        .collect();
+    if held.is_empty() {
+        return;
+    }
+    let block = at / BLOCK;
+    for other in held {
+        for (a, b) in [(other, block), (block, other)] {
+            let links = g.alias_of.entry(a).or_default();
+            if !links.contains(&b) {
+                links.push(b);
+            }
+        }
+    }
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    // Already guarded by its own watcher: what it knows of the block stays.
+    if !g.protected.insert(block) {
+        return;
+    }
+    let mut old = 0;
+    // SAFETY: title view memory the runtime just mapped; only its
+    // protection changes (failing harmlessly if it is gone again).
+    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) != 0 } {
+        g.clean.insert(block);
+        ALIAS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        g.protected.remove(&block);
     }
 }
 
@@ -834,6 +1006,12 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            // A write through one mapping reaches the pages everywhere they
+            // show: their copies' marks ([`marked`]).
+            let marks = marked(&mut g, at / BLOCK);
+            if marks > 0 {
+                ALIAS[1].fetch_add(marks as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
