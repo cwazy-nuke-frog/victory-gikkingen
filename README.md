@@ -38,7 +38,7 @@ Base: fxceless/victory-fork `c96b4f2`. Additions:
 - `VICTORY_PIPELINE_WORKERS`: pipeline worker count. `VICTORY_VIEW_HEAP_FIT=1`: the title's view
   heap fits under the 1,000,000 views of NVIDIA and vkd3d-proton.
 
-Measurements and causes: refer to [FINDINGS.md](https://github.com/vongikkingen/gta6-linux-victory/blob/main/FINDINGS.md).
+Measurements and causes: refer to [port/FINDINGS.md](port/FINDINGS.md).
 
 ## Run configuration
 
@@ -60,8 +60,8 @@ Measurements and causes: refer to [FINDINGS.md](https://github.com/vongikkingen/
 
 Agentic loop. A mini swarm of 6 or 7 agents works on this repository in a continuous loop.
 Tasks: monitor VIctory and its forks, port fixes, run unattended trials, evaluate the results.
-Loop tooling, findings and demo: [vongikkingen/gta6-linux-victory](https://github.com/vongikkingen/gta6-linux-victory). Trial queue,
-sandboxed launch, image metrics, paired statistics, security gate. License: MIT.
+Loop tooling in [port/](port/): trial queue, sandboxed launch, image metrics, paired statistics,
+security gate. Refer to the header of each script in `port/run/`. License of `port/`: MIT.
 
 ## Credits
 
