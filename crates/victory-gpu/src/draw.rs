@@ -1941,32 +1941,32 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let last = table.checked_add(u64::from(n - 1) * 32);
+            let (start, end) = fresh_table_range(
+                entries.iter().map(|u| u.table_offset_dwords / 8),
+                &selected,
+                host.count(),
+            );
+            let n = end - start;
+            let last = table.checked_add(u64::from(end - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
+            // The table's used range and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
+                start.hash(&mut h);
+                for k in start..end {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -1984,7 +1984,7 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, base * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -1993,16 +1993,19 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            // Entry `k` of the table lies at `base + k`: only `start..end` is
+            // taken, and `start <= host.count() <= first` keeps `base` whole.
+            let base = first - start;
+            self.fresh_tables.insert(key, base);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            let title_first = heap.index(table).filter(|first| first + end <= host.count());
+            // The whole used range: a shader may index between the entries
+            // its used-resource list names (descriptor arrays).
+            for k in start..end {
+                let index = base + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
@@ -2043,7 +2046,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, base * 32));
         }
         made
     }
@@ -2689,4 +2692,59 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// The `[start, end)` entries a fresh table takes dynamic slots for: from the
+/// first entry the draw uses (by its used-resource list or a picked index) to
+/// the last, instead of from entry 0. `start` is at most `mirrored`, so that
+/// `first - start` stays whole for any dynamic slot `first >= mirrored`.
+/// After upstream VIctory PR #1349 (wrothgaril), with this fork's picked indices.
+fn fresh_table_range(used: impl Iterator<Item = u32>, selected: &[u32], mirrored: u32) -> (u32, u32) {
+    let (mut low, mut high) = (u32::MAX, 0);
+    for k in used.chain(selected.iter().copied()) {
+        low = low.min(k);
+        high = high.max(k);
+    }
+    if low == u32::MAX {
+        return (0, 1);
+    }
+    let start = low.min(mirrored);
+    (start, high.max(start) + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fresh_table_range;
+
+    /// A table whose draw uses entries 120 and 123 takes 4 slots, not 124.
+    #[test]
+    fn fresh_tables_take_their_used_range() {
+        assert_eq!(fresh_table_range([120, 123].into_iter(), &[], 737_856), (120, 124));
+        // A picked index widens the range on either side.
+        assert_eq!(fresh_table_range([120, 123].into_iter(), &[118, 130], 737_856), (118, 131));
+        // No used entry: one slot, as before.
+        assert_eq!(fresh_table_range(std::iter::empty(), &[], 737_856), (0, 1));
+        // A small mirrored part clamps `start` so `first - start` does not underflow.
+        assert_eq!(fresh_table_range([120, 123].into_iter(), &[], 4), (4, 124));
+    }
+
+    /// The shader's slot for entry `k` is `(base * 32 + k * 32) >> 5` with
+    /// `base = first - start`: entries land on the slots taken, and the next
+    /// table starts right after them.
+    #[test]
+    fn trimmed_tables_index_the_slots_they_take() {
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 256) else {
+            return; // no host GPU
+        };
+        let (start, end) = fresh_table_range([120, 123].into_iter(), &[], heap.count());
+        let n = end - start;
+        let first = heap.dynamic(n).expect("dynamic slots");
+        let base = first - start;
+        assert_eq!((base * 32 + 120 * 32) >> 5, first);
+        assert_eq!((base * 32 + 123 * 32) >> 5, first + 3);
+        let next = heap.dynamic(1).expect("next dynamic slot");
+        assert_eq!(next, first + 4);
+        heap.release(first, n);
+        heap.release(next, 1);
+    }
 }
