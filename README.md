@@ -12,11 +12,10 @@ It is not affiliated with or endorsed by the game's developer or publisher.
 - Scene: prologue, prison. Cell, characters, clothing and yard are drawn.
 - Defects: lighting changes between launches. Some launches stop at init (exit code 3): 4 of 48 test launches on 2026-11-25, none in
   the last 40. Launch again.
-- Rate: approximately 3 fps (310 to 350 ms per frame on the still shot, RTX 3090). Series S mode
-  (`CONSOLE=series-s`, 1080p, development branch, not published yet): 265 to 275 ms. The title's own code is light (about 104 ms of CPU a
-  frame over 16 threads); the submitting thread of the layer binds: waits for flights in the air
-  (about 140 ms per frame) and page guards of view memory (about 57 ms). Refer to
-  [port/FINDINGS.md](port/FINDINGS.md), sections 6 to 8.
+- Rate: approximately 3.6 fps (264 to 281 ms per frame on the still shot, RTX 3090; 310 to 350 ms
+  on the previous release). The title's own code is light (about 104 ms of CPU a frame over 16
+  threads); the layer sets the frame time: the card's work for the title's indirect draws and the
+  submitting thread's waits. Refer to [port/FINDINGS.md](port/FINDINGS.md), sections 6 to 8.
 
 ## Demo
 
@@ -27,7 +26,7 @@ window is blurred. Media are kept out of this repository (asset policy, rule #1)
 
 ## Changes on this branch
 
-Base: fxceless/victory-fork `c96b4f2`. Additions:
+Base: fxceless/victory-fork `0b0074e0` (main, 2026-11-25). Additions:
 
 - Aliased title pages: a write through one mapping reaches all mappings (port of upstream
   VIctory #1122). Result: the cell wall is drawn in each launch.
@@ -37,6 +36,14 @@ Base: fxceless/victory-fork `c96b4f2`. Additions:
   Result: correct clothing colours.
 - Compute-only shader loop limit, `VICTORY_SHADER_LOOP_LIMIT_CS` (port of Danigamer05 `3de85981`).
 - Wave64 programs on 32-lane hosts: shared-memory ordering rule for the two wave halves.
+- Indirect draws: the clamps of a run of indirect draws are recorded in a list before the one
+  that draws, so the render pass is not broken before each draw (port of Belobug
+  `380981c5`, `VICTORY_HOIST_CLAMPS=7`). Result: about -60 ms per frame on the still shot.
+- View memory: a write through one view of a page marks the other views written instead of
+  opening them (port of larelgit `dffa593c`, `VICTORY_VIEW_GUARD=2`). Result: about -60 ms per
+  frame against the guard of every view, with the cell wall kept.
+- The internal indirect bound shader is written in the HLSL that compiles under Wine; without it,
+  every indirect draw is dropped and the picture is grey.
 - Indirect dispatches: past 65,535 groups in x, the rest runs in a second execution (port of
   Carlos Sant'Anna `0135c410`), and the budget is charged in lane order, one dispatch per 64 records
   (port of xiaotu030202 `fb5c67ad`). Result: no light-blue blocky tiles at the bottom edge (9 of 9
@@ -53,7 +60,7 @@ Measurements and causes: refer to [port/FINDINGS.md](port/FINDINGS.md).
 - Build: `cargo xwin build --profile diag -p victory --features diagnostics
   --target x86_64-pc-windows-msvc`. Run `victory.exe` under Proton Experimental.
 - Switches used for the demo: `VICTORY_VIEW_HEAP_FIT=1 VICTORY_PIPELINE_WORKERS=10
-  VICTORY_LEAN_WINDOWS=1`, `VKD3D_CONFIG=descriptor_heap`,
+  VICTORY_LEAN_WINDOWS=1 VICTORY_HOIST_CLAMPS=7 VICTORY_VIEW_GUARD=2`, `VKD3D_CONFIG=descriptor_heap`,
   `VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains`.
 - Add `VICTORY_STALE_TEXTURES=0`: skin is matte in 4 of 4 test launches. Without it, skin is waxy or
   white in some launches.
