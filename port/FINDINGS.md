@@ -1,7 +1,7 @@
 # Findings
 
 Measurements from unattended trials of the GTA VI Xbox build under Proton with VIctory, on the
-machine described in the README (2026-11-25). Each one cost us trials to separate from noise;
+machine described in the README (2026-11-25, sections 6-8 added the same afternoon). Each one cost us trials to separate from noise;
 they may save another port the same work.
 
 ## 1. The cell wall is missing at random per launch: stale copies of aliased pages
@@ -53,6 +53,52 @@ Compare speed on the still shot, with two independent pairs.
 NVIDIA Xid 31 (GPU MMU fault) appeared about one second after our own `pkill -KILL` at the end
 of a trial, never during one. `stats.py` splits kernel Xid lines into "during the trial" and
 "within 5 s after our own stop"; only the first group counts.
+
+## 6. Where a frame goes: the title is light, the layer is not
+
+Profile of one trial on the fid9 line (369 ms a frame on the still shot), 25 s of samples, and a
+replay of the per-second accounts of nine trials.
+
+- The title's own code runs about 104 ms of CPU a frame over its 16 worker threads, the same at
+  209 and at 369 ms a frame. No title thread runs more than 16 ms a frame. The submitting thread
+  runs under 4 ms of title code a frame; the rest of its time is in the layer.
+- The submitting thread binds: about 223 ms of serial work and 146 ms of waits a frame. The serial
+  work: page guards of view memory 57 ms (about 470 faults a frame, about 120 us each, through
+  Wine's signal path), other write tracking 13 ms, the asking and the look under flights 25 ms,
+  bytes moved into host copies 21 ms, descriptor sync 18 ms, uploads 14 ms, textures 13 ms.
+- One wait for flights is the card finishing what is in the air, not the fetch: wait = 5.5 x (card
+  busy time / submissions) + 0.75 x one fetch wait, fitted on nine trials within 3 ms a wait.
+- The card is busy about 212 ms a frame with work of ours queued; Series S resolution takes 55 ms
+  of it off, so resolution explains about a quarter.
+- The trial pays for its own proof: PNG captures cost about 9 ms a frame on the submitting thread.
+
+## 7. Switches measured with no effect here
+
+RTX 3090, Linux, Proton, still shot against the same family (310-350 ms for fid5, 369-377 ms for
+fid9), margin about 20 ms:
+
+- `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1` (fxceless `f85101b6`): 359 ms. The copy queue
+  received no work after the first second (0 jobs a frame, relay on). Compare fxceless issue #873,
+  where the same switches gained 15 % on an RTX 4070 but lost the window's wire mesh.
+- `VICTORY_INDIRECT_WINDOW=1`: 356 and 381 ms. Bounded indirect commands went from about 5,150 to
+  about 2,550 a frame, with no change on the still shot.
+- `VICTORY_CARD_FETCH_INFLIGHT=1`: about 935 pieces a frame merged inside flights, 367 ms.
+- `VICTORY_LATE_COPY_AFTER=1` (port of `5851154f`) on fid5: 318 ms. The copy wait moves, it does
+  not go away.
+- RT-miss fallback light (felicienradio): no visible change on the still shot (mean luma 61.7
+  against 61.4).
+- Under Wine, `K32EmptyWorkingSet` is a stub and `FILE_FLAG_NO_BUFFERING` never reaches `open()`:
+  a working-set relief valve and unbuffered DirectStorage reads measured on Windows do nothing here
+  (wine `dlls/kernelbase/process.c`, `server/fd.c`, `dlls/ntdll/unix/file.c`).
+
+## 8. Series S mode: 55-60 ms faster at 1080p
+
+`CONSOLE=series-s` on a development branch (fid5 plus four commits for the second present plane
+and two render target formats, not published yet): 265, 275 and 268 ms on the still shot in three launches, the
+wall drawn in all three, against 310-350 ms in Series X mode. Output is 1080p instead of 4K. Two
+defects so far: about one presented frame in sixteen before the world is an empty black layer
+(fixed on our side by keeping the last image on screen, not published yet), and Lucia's skin
+sometimes turns black in the world (open).
 
 ## Reproducing
 

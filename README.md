@@ -13,9 +13,11 @@ It is not affiliated with or endorsed by the game's developer or publisher.
 - Defects: light-blue blocky tiles at the bottom edge in some launches. Lighting changes between
   launches. Some launches stop at init (exit code 3): 4 of 48 test launches on 2026-11-25, none in
   the last 40. Launch again.
-- Rate: approximately 3 fps (310 to 350 ms per frame on the still shot, RTX 3090). Main limits: the
-  submitting thread waits for copy-back of GPU writes (about 140 ms per frame) and refreshes guarded
-  title memory (about 95 ms per frame).
+- Rate: approximately 3 fps (310 to 350 ms per frame on the still shot, RTX 3090). Series S mode
+  (`CONSOLE=series-s`, 1080p, development branch, not published yet): 265 to 275 ms. The title's own code is light (about 104 ms of CPU a
+  frame over 16 threads); the submitting thread of the layer binds: waits for flights in the air
+  (about 140 ms per frame) and page guards of view memory (about 57 ms). Refer to
+  [port/FINDINGS.md](port/FINDINGS.md), sections 6 to 8.
 
 ## Demo
 
