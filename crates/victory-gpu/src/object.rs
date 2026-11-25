@@ -294,7 +294,7 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
 /// The return address of whoever called our caller, as `+offset` into its
 /// module.
 #[inline(never)]
-fn caller() -> String {
+pub(crate) fn caller() -> String {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;

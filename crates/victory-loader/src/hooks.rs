@@ -46,16 +46,49 @@ const WATCHDOG: &[Patch] = &[
     },
 ];
 
+/// Environment variable that shrinks the title's shader-visible view heap.
+pub(crate) const VIEW_HEAP_FIT_ENV: &str = "VICTORY_VIEW_HEAP_FIT";
+
+/// The title sizes its shader-visible view heap as 0x58000 + R * P / 32
+/// views, with its descriptor page count P = 216 (1,245,184 views). Hosts
+/// capped at 1,000,000 (NVIDIA, vkd3d-proton) leave a quarter of it without
+/// host slots. P = 140 gives 933,888, under the 934,464 left beside our
+/// dynamic slots. P is set once by this immediate (R in the low half) and
+/// every user reads it back (heap size, page pool, streaming budgets).
+const VIEW_HEAP_FIT: &[Patch] = &[Patch {
+    what: "view heap: descriptor page count 216 -> 140",
+    rva: 0x43a485e,
+    // mov rcx, 0x000000D8_00020000 (P, R)
+    expect: &[0x48, 0xB9, 0x00, 0x00, 0x02, 0x00, 0xD8, 0x00, 0x00, 0x00],
+    new: &[0x48, 0xB9, 0x00, 0x00, 0x02, 0x00, 0x8C, 0x00, 0x00, 0x00],
+}];
+
 /// Applies the watchdog patches whose bytes match. Returns how many applied.
 ///
 /// # Safety
 /// `base` is the mapped image whose original BLAKE3 is `hash`, and no title
 /// code is running yet.
 pub(crate) unsafe fn disarm_watchdog(base: usize, hash: &blake3::Hash) -> usize {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { apply_all(base, hash, WATCHDOG) }
+}
+
+/// Applies the view heap patch if its bytes match. Returns how many applied.
+///
+/// # Safety
+/// See `disarm_watchdog`.
+pub(crate) unsafe fn fit_view_heap(base: usize, hash: &blake3::Hash) -> usize {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { apply_all(base, hash, VIEW_HEAP_FIT) }
+}
+
+/// # Safety
+/// See `disarm_watchdog`.
+unsafe fn apply_all(base: usize, hash: &blake3::Hash, patches: &[Patch]) -> usize {
     if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
         return 0;
     }
-    WATCHDOG
+    patches
         .iter()
         // SAFETY: forwarded from this function's contract.
         .filter(|p| unsafe { apply(base, p) })

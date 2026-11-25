@@ -927,7 +927,7 @@ pub(crate) extern "system" fn create_heap(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
-    tracing::debug!(?desc, placed, "descriptor heap");
+    tracing::info!(?desc, placed, caller = crate::object::caller(), "descriptor heap");
     let (start, memory) = if placed {
         (placement.address, None)
     } else {
