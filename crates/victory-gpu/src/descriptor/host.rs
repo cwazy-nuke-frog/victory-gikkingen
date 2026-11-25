@@ -2633,6 +2633,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         }
         return true;
     }
+    // The light format, of a texture made readable as it.
+    const R9G9B9E5: u32 = 67;
+    if view == R9G9B9E5 && !unordered && crate::resource::reads_as_light(texture) {
+        return true;
+    }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
@@ -2773,6 +2778,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A texture that has another's host copy as its own reads
+                // it in its own format (`crate::resource::shared_copy`).
+                if let Some(d) = desc.as_mut().filter(|d| d.Format.0 == 0)
+                    && let Some(format) = crate::resource::light_format(resource, texture)
+                {
+                    d.Format.0 = format;
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }

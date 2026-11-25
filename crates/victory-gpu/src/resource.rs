@@ -1190,6 +1190,123 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Whether [`alias_share`] was asked for (`VICTORY_ALIAS_SHARE=1`).
+#[cfg(windows)]
+fn alias_share_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SHARE").is_some_and(|v| v == "1"))
+}
+
+/// One creation with a castable format failed: none is tried again.
+#[cfg(windows)]
+static SHARE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host device that makes R32_UINT textures readable as R9G9B9E5, if
+/// that was asked for (`VICTORY_ALIAS_SHARE=1`; off by default) and the
+/// host can: a view the title places as R9G9B9E5 in the memory of such a
+/// texture ([`alias_of`]) then reads the texture's own host copy
+/// ([`shared_copy`]), where a second texture was kept up to date by copies
+/// (`crate::texture::alias`: 78 to 90 copies a frame in the world, 14 to
+/// 20 ms of the card's time). The host must cast formats of one texel
+/// width (relaxed format casting, with its enhanced barriers); without
+/// that, or once a creation fails, textures are made and copied as before.
+#[cfg(windows)]
+fn alias_share() -> Option<&'static windows::Win32::Graphics::Direct3D12::ID3D12Device10> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    static DEVICE: std::sync::OnceLock<Option<ID3D12Device10>> = std::sync::OnceLock::new();
+    if !alias_share_asked() || SHARE_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let host = crate::host::host()?;
+    DEVICE
+        .get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            // SAFETY: a plain query into a structure of ours.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut options).cast(),
+                    std::mem::size_of_val(&options) as u32,
+                )
+            };
+            let casts = asked.is_ok()
+                && options.EnhancedBarriersSupported.as_bool()
+                && options.RelaxedFormatCastingSupported.as_bool();
+            let device = host.device.cast::<ID3D12Device10>().ok().filter(|_| casts);
+            tracing::info!(
+                casts,
+                device = device.is_some(),
+                "asked: views placed as R9G9B9E5 in R32_UINT textures the host writes share the host copy (if the host casts and has the device)"
+            );
+            device
+        })
+        .as_ref()
+}
+
+/// The R32_UINT format the title packs light into, and the R9G9B9E5 its
+/// placed views read it as.
+#[cfg(windows)]
+const PACKED_LIGHT: (u32, u32) = (42, 67);
+
+/// The mark, in a host texture's private data, of one made readable as
+/// R9G9B9E5 ([`alias_share`]).
+#[cfg(windows)]
+const LIGHT_MARK: windows::core::GUID = windows::core::GUID::from_u128(0x95614bfb66af446b957af05e40011ba8);
+
+/// Whether the host made `texture` readable as R9G9B9E5 too
+/// ([`alias_share`]).
+#[cfg(windows)]
+pub(crate) fn reads_as_light(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    let (mut size, mut mark) = (1u32, 0u8);
+    // SAFETY: a live resource; a byte of ours for the byte stored.
+    let found = unsafe { texture.GetPrivateData(&LIGHT_MARK, &mut size, Some((&raw mut mark).cast())) };
+    found.is_ok() && mark == 1
+}
+
+/// For `this`, the texture of a view placed as R9G9B9E5 in the memory of
+/// an R32_UINT texture the host writes: that texture's host copy, to be
+/// its own ([`alias_share`]).
+/// shortcut: only textures of one level and one layer. A pass may read one
+/// level through the view while it writes the next (the light atlas's four
+/// levels are made so), and a host texture has one state for all of it:
+/// those keep their own texture and its copies.
+#[cfg(windows)]
+fn shared_copy(this: This, desc: &ResourceDesc) -> Option<std::sync::Arc<HostTexture>> {
+    if !alias_share_asked()
+        || pc_format(desc.format) != PACKED_LIGHT.1
+        || desc.mip_levels != 1
+        || desc.depth_or_array_size != 1
+    {
+        return None;
+    }
+    let (copy, _) = hosted(alias_of(this)?, true)?;
+    reads_as_light(&copy.texture).then_some(copy)
+}
+
+/// Whether `placed` has the host copy of `source` as its own
+/// ([`shared_copy`]): what the host wrote to `source` is what the view
+/// reads, with no copy. Makes the host copies that are not made yet, as
+/// the copy between them would.
+#[cfg(windows)]
+pub(crate) fn shares(placed: This, source: This) -> bool {
+    alias_share_asked()
+        && hosted(placed, true)
+            .zip(hosted(source, true))
+            .is_some_and(|(p, s)| std::sync::Arc::ptr_eq(&p.0, &s.0))
+}
+
+/// The format a shader view of `this` names if the title's names none:
+/// R9G9B9E5 for a texture that shares an R32_UINT host copy
+/// ([`shared_copy`]), whose own format is not the view's.
+#[cfg(windows)]
+pub(crate) fn light_format(this: This, texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Option<i32> {
+    (alias_share_asked()
+        && pc_format(resource(this).desc.format) == PACKED_LIGHT.1
+        && reads_as_light(texture))
+    .then_some(PACKED_LIGHT.1 as i32)
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1300,6 +1417,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         return None;
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.is_none() && make && let Some(copy) = shared_copy(this, &r.desc) {
+        static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SHARED.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                view = ?this,
+                width = r.desc.width,
+                height = r.desc.height,
+                n,
+                "a view placed in the memory of a texture the host writes shares its host copy"
+            );
+        }
+        *made = Some((copy, None));
+        crate::descriptor::texture_made(this as usize);
+    }
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
@@ -2110,7 +2242,62 @@ fn host_texture_as(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    // An R32_UINT texture the host writes may be read as R9G9B9E5
+    // ([`alias_share`]): made with that as a castable format, from a state
+    // the creation call has a layout for.
+    let layout = match crate::host::legal_for(d.flags, crate::host::texture_state(state)) {
+        0 => Some(D3D12_BARRIER_LAYOUT_COMMON),
+        0x8 => Some(D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS),
+        0x40 | 0x80 | 0xc0 => Some(D3D12_BARRIER_LAYOUT_SHADER_RESOURCE),
+        0x400 => Some(D3D12_BARRIER_LAYOUT_COPY_DEST),
+        0x800 => Some(D3D12_BARRIER_LAYOUT_COPY_SOURCE),
+        _ => None,
+    };
+    if !reserved
+        && d.format == PACKED_LIGHT.0
+        && d.flags & (UNORDERED | DEPTH) == UNORDERED
+        && let Some(layout) = layout
+        && let Some(device) = alias_share()
+    {
+        let mut wide = D3D12_RESOURCE_DESC1::default();
+        let light = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(PACKED_LIGHT.1 as i32)];
+        // SAFETY: `d` has the layout of that description's first fields
+        // (the cast below relies on the same), the rest stays zero; the
+        // out pointer is ours.
+        let cast = unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&raw const d).cast::<u8>(),
+                (&raw mut wide).cast::<u8>(),
+                std::mem::size_of::<ResourceDesc>().min(std::mem::size_of::<D3D12_RESOURCE_DESC>()),
+            );
+            device.CreateCommittedResource3(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &wide,
+                layout,
+                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                None::<&ID3D12ProtectedResourceSession>,
+                Some(&light[..]),
+                &mut texture,
+            )
+        };
+        // The mark says which textures a view may read as light: one that
+        // could not be marked is made again, plain.
+        let mark = 1u8;
+        // SAFETY: a live resource; a byte of ours.
+        let marked = cast.and_then(|()| match &texture {
+            Some(t) => unsafe { t.SetPrivateData(&LIGHT_MARK, 1, Some((&raw const mark).cast())) },
+            None => Ok(()),
+        });
+        if let Err(e) = marked {
+            SHARE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(error = %e, desc = ?d, "no texture with a castable format: made and copied as before from here on");
+            texture = None;
+        }
+    }
+    let made = if texture.is_some() {
+        Ok(())
+    } else if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;

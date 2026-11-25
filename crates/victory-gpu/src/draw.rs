@@ -3331,8 +3331,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // None where the view's texture has that texture's host copy
+            // as its own (`crate::resource::shares`).
+            let aliased = crate::resource::alias_of(*resource as This).is_some_and(|source| {
+                crate::resource::shares(*resource as This, source)
+                    || crate::texture::alias(list, *resource as This, source)
+            });
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
