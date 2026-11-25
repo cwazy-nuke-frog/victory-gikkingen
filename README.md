@@ -11,8 +11,11 @@ It is not affiliated with or endorsed by the game's developer or publisher.
 - Current state: close-to-console rendering. Work in progress.
 - Scene: prologue, prison. Cell, characters, clothing and yard are drawn.
 - Defects: light-blue blocky tiles at the bottom edge in some launches. Lighting changes between
-  launches. Approximately 1 launch in 3 stops at init (exit code 3). Launch again.
-- Rate: approximately 3 fps (300 ms per frame). Main limit: waits on GPU fences during copy-back.
+  launches. Some launches stop at init (exit code 3): 4 of 48 test launches on 2026-11-25, none in
+  the last 40. Launch again.
+- Rate: approximately 3 fps (310 to 350 ms per frame on the still shot, RTX 3090). Main limits: the
+  submitting thread waits for copy-back of GPU writes (about 140 ms per frame) and refreshes guarded
+  title memory (about 95 ms per frame).
 
 ## Demo
 
@@ -47,6 +50,8 @@ Measurements and causes: refer to [port/FINDINGS.md](port/FINDINGS.md).
 - Switches used for the demo: `VICTORY_VIEW_HEAP_FIT=1 VICTORY_PIPELINE_WORKERS=10
   VICTORY_LEAN_WINDOWS=1`, `VKD3D_CONFIG=descriptor_heap`,
   `VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains`.
+- Add `VICTORY_STALE_TEXTURES=0`: skin is matte in 4 of 4 test launches. Without it, skin is waxy or
+  white in some launches.
 
 ## Test configuration
 
