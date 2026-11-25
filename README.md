@@ -10,8 +10,7 @@ It is not affiliated with or endorsed by the game's developer or publisher.
 
 - Current state: close-to-console rendering. Work in progress.
 - Scene: prologue, prison. Cell, characters, clothing and yard are drawn.
-- Defects: light-blue blocky tiles at the bottom edge in some launches. Lighting changes between
-  launches. Some launches stop at init (exit code 3): 4 of 48 test launches on 2026-11-25, none in
+- Defects: lighting changes between launches. Some launches stop at init (exit code 3): 4 of 48 test launches on 2026-11-25, none in
   the last 40. Launch again.
 - Rate: approximately 3 fps (310 to 350 ms per frame on the still shot, RTX 3090). Series S mode
   (`CONSOLE=series-s`, 1080p, development branch, not published yet): 265 to 275 ms. The title's own code is light (about 104 ms of CPU a
@@ -38,6 +37,10 @@ Base: fxceless/victory-fork `c96b4f2`. Additions:
   Result: correct clothing colours.
 - Compute-only shader loop limit, `VICTORY_SHADER_LOOP_LIMIT_CS` (port of Danigamer05 `3de85981`).
 - Wave64 programs on 32-lane hosts: shared-memory ordering rule for the two wave halves.
+- Indirect dispatches: past 65,535 groups in x, the rest runs in a second execution (port of
+  Carlos Sant'Anna `0135c410`), and the budget is charged in lane order, one dispatch per 64 records
+  (port of xiaotu030202 `fb5c67ad`). Result: no light-blue blocky tiles at the bottom edge (9 of 9
+  test launches with the fix, against most launches before).
 - Merged community PRs: fork #24, #92, #95, #108, #127, #156, #213, #218, #257, #259, #265;
   upstream #454; ray-tracing traces branch by sedzz (off by default).
 - `VICTORY_PIPELINE_WORKERS`: pipeline worker count. `VICTORY_VIEW_HEAP_FIT=1`: the title's view
