@@ -114,7 +114,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -1455,6 +1456,113 @@ mod tests {
                 got[6],
                 out[0][6]
             );
+        }
+    }
+
+    /// A program that reads its thread-group id in x takes the dispatch's
+    /// first group from a user-data dword the host sets (`USER_GROUP_BASE`)
+    /// and adds the host's group id to it: the host runs the groups past
+    /// 65,535 of an indirect record as a second execution with it at 65,535.
+    #[test]
+    fn the_group_id_in_x_starts_at_the_host_base() {
+        let words: &[u32] = &[
+            0x7E02_0205, // v_mov_b32 v1, s5 (the group id in x)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+            0x3610_028F, // v_and_b32 v8, 15, v1
+            0x340E_1082, // v_lshlrev_b32 v7, 2, v8
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            // Five user SGPRs, then the group id in x (s5).
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let base = out
+            .user_data
+            .iter()
+            .find(|u| u.root == RootType::Other(super::USER_GROUP_BASE))
+            .map(|u| u.index as usize)
+            .expect("no user-data dword for the first group");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let (root, pso) = host.compute_pipeline(&out).unwrap();
+            // Three groups, with the first at 0 and at 65,535: each stores
+            // the id it read at slot (id & 15).
+            for (first, slots) in [(0u32, [0usize, 1, 2]), (65535, [15, 0, 1])] {
+                let mut values = vec![0u32; out.user_data_dwords() as usize];
+                values[base] = first;
+                let done = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(values))],
+                            views: &[super::host::View::RawUav(64)],
+                            samplers: &[],
+                            groups: [3, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                for (k, slot) in slots.into_iter().enumerate() {
+                    assert_eq!(
+                        done[0][slot],
+                        first + k as u32,
+                        "group {k} with the first at {first}: {:?}",
+                        &done[0][..16]
+                    );
+                }
+            }
         }
     }
 }
