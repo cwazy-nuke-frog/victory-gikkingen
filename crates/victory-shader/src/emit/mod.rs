@@ -461,6 +461,37 @@ pub fn emit(
                 }
             }
         }
+        // Last of all: LDS written and read inside one lane branch's region
+        // ([`lower::with_lds_unordered`]), in each form, then in each form per host wave.
+        // (`VICTORY_WAVE_LDS_UNORDERED=0` turns it off.)
+        if std::env::var_os("VICTORY_WAVE_LDS_UNORDERED").is_none_or(|v| v != "0") {
+            let mut all = vec![("as is", (p, st, io, res))];
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    all.push((*name, (p, st, io, res)));
+                }
+            }
+            let per_wave = local_on && !strict && !exact_only;
+            for local in [false, true].into_iter().filter(|&l| !l || per_wave) {
+                for &(name, (p, st, io, res)) in &all {
+                    let emit = || emit_program(c, native, p, st, io, res);
+                    let again = lower::with_lds_unordered(|| {
+                        if local {
+                            lower::with_local_waves_any(emit)
+                        } else {
+                            emit()
+                        }
+                    });
+                    report(
+                        &format!("LDS unordered (APPROXIMATE), local waves {local}, {name}"),
+                        &again,
+                    );
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -1467,6 +1498,66 @@ mod atomic_tests {
                 v.validate(&mut shader.dxil.clone()).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lds_unordered_tests {
+    use super::*;
+    use crate::native::{ComputeIo, RootParam, StageIo};
+
+    /// One console wave of 64 threads on a host of 32-lane waves, with an LDS write and a
+    /// read in the body of a loop thread t runs t + 1 times: the two host waves cannot meet
+    /// inside it, so the program keeps 64-lane waves unless LDS may go unordered there
+    /// ([`lower::with_lds_unordered`]).
+    #[test]
+    fn lds_written_and_read_in_one_lane_branch_splits_only_as_a_last_resort() {
+        let words = [
+            0x3402_0082u32, // v_lshlrev_b32 v1, 2, v0
+            0x7E06_0280,    // v_mov_b32 v3, 0
+            0x7D88_0103,    // loop: v_cmp_gt_u32 vcc, v3, v0
+            0x8AFE_6A7E,    // s_andn2_b64 exec, exec, vcc
+            0xBF88_0006,    // s_cbranch_execz done
+            0xD834_0000,
+            0x0000_0001, // ds_write_b32 v1, v0
+            0xD8D8_0004,
+            0x0200_0001, // ds_read_b32 v2, v1 offset:4
+            0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+            0xBF82_FFF7, // s_branch loop
+            0xBF81_0000, // done: s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 4 << 1, // 512 bytes of LDS, s0..s3
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let plain = emit_program(&c, &native, &p, &st, &io, &res).map(|r| r.1);
+        let unordered = lower::with_lds_unordered(|| emit_program(&c, &native, &p, &st, &io, &res))
+            .map(|r| r.1);
+        lower::TEST_HOST_WAVE.set(was);
+        assert_eq!(plain.unwrap(), Some(64));
+        assert_eq!(unordered.unwrap(), Some(32));
     }
 }
 

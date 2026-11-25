@@ -1001,7 +1001,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if !LDS_UNORDERED.get() && (0..n).any(|r| reads[r] && writes[r]) {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1068,6 +1068,20 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_lds_unordered`].
+    static LDS_UNORDERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with an LDS write and read inside one lane branch's region taken in a console wave
+/// split in two host waves ([`lds_meetings`] refuses that otherwise): the waves still meet
+/// around the region, not inside it (the rule of upstream VIctory #1890).
+/// shortcut: inside the region a half may read a dword before the other half writes it. Used
+/// only for programs that do not translate otherwise.
+pub(super) fn with_lds_unordered<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_UNORDERED.replace(true);
+    let r = f();
+    LDS_UNORDERED.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
