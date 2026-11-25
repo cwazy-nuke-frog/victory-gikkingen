@@ -556,7 +556,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // its pages (`open`), still read-only. That view may be one
                 // no copy checks: guarded again here, with the others.
                 g.clean.insert(block);
-                if view_guard() {
+                if views_stay_guarded() {
                     protect_aliases(&mut g, block);
                 }
             } else {
@@ -666,6 +666,14 @@ fn view_guard() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }
 
+/// Whether a write through one view leaves the other views of its pages
+/// read-only and only notes them written (`VICTORY_VIEW_GUARD=2`).
+/// Otherwise it opens them all.
+fn views_stay_guarded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_some_and(|v| v == "2"))
+}
+
 /// Diagnostics: blocks guarded together with their other views, blocks
 /// noted written because another view of theirs was written, and blocks
 /// opened because a view of theirs was mapped; since the start.
@@ -746,27 +754,38 @@ fn uncommitted_end(block: usize) -> usize {
 /// (or is ours, `crate::host::copy_mapped`) goes through one view, and
 /// every guard over the pages must copy them again.
 ///
-/// Those other views stay read-only. `guard` reports a block that is
-/// read-only and not clean as written, and a write through one of them
-/// still faults and opens it. Opening them all cost two changes of
-/// protection for every other view of every page written (one here, one
-/// when the next check guarded it again), most of them for views the
-/// title did not write through before that check.
+/// With [`views_stay_guarded`] those other views stay read-only. `guard`
+/// reports a block that is read-only and not clean as written, and a
+/// write through one of them still faults and opens it. Without it they
+/// are opened: two changes of protection for every other view of every
+/// page written (one here, one when the next check guards it again), most
+/// of them for views the title does not write through before that check.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let any = open_here(g, start, end);
     if start >= end || g.aliased.is_empty() {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let stay = views_stay_guarded();
     for block in aliased {
         // Guarded with the others again when its own check, or the next
         // check of one of them, finds the pages written.
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            let alias = alias / BLOCK;
-            if alias != block && g.protected.contains(&alias) && g.clean.remove(&alias) {
+            let other = alias / BLOCK;
+            let noted = if other == block {
+                false
+            } else if stay {
+                g.protected.contains(&other) && g.clean.remove(&other)
+            } else {
+                open_here(g, alias, alias.saturating_add(BLOCK))
+            };
+            if noted {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !stay {
+                g.aliased.remove(&other);
             }
         }
     }
@@ -1648,9 +1667,12 @@ mod tests {
     /// A write through a view that no copy checks: the checked view is
     /// noted written and left read-only, its check reports the pages and
     /// guards the written view again, so a second write through it is seen
-    /// as well.
+    /// as well. Run with `VICTORY_VIEW_GUARD=2`.
     #[test]
     fn a_view_no_copy_checks_is_guarded_again_by_the_checked_one() {
+        if !views_stay_guarded() {
+            return;
+        }
         let (section, checked, other) = two_views(BLOCK);
         assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
         assert!(!writable(other), "guarded with the checked view");
