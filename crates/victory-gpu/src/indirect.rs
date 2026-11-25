@@ -42,6 +42,10 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // The first record this dispatch clamps: the caller dispatches one group
+    // per 64 records (see `record_clamp_as`), so a chunk's charges land in
+    // lane order rather than in whatever order the groups ran in.
+    uint base;
 };
 StructuredBuffer<uint> src_args : register(t0);
 StructuredBuffer<uint> count_buf : register(t1);
@@ -59,10 +63,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf[count_offset / 4u]);
     }
-    if (id.x >= eff_count) return;
+    // The record this thread clamps: the caller runs one group per 64
+    // records, and `base` says which 64. One group of 64 threads, so the
+    // thread id is the lane.
+    uint index = base + id.x;
+    if (index >= eff_count) return;
     uint stride_words = stride / 4u;
-    uint src_at = (args_offset / 4u) + id.x * stride_words;
-    uint dst_at = id.x * stride_words;
+    uint src_at = (args_offset / 4u) + index * stride_words;
+    uint dst_at = index * stride_words;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -219,12 +227,12 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     }
 }
 
-/// Constants b0 (six words), SRVs t0..t1, and UAVs u0..u1.
+/// Constants b0 (seven words), SRVs t0..t1, and UAVs u0..u1.
 fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
     crate::host::root_signature_from_params(
         device,
         &[
-            crate::host::root_param_constants(0, 6),
+            crate::host::root_param_constants(0, 7),
             crate::host::root_param_descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
             crate::host::root_param_descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
             crate::host::root_param_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
@@ -365,7 +373,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, 0];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -401,12 +409,30 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One dispatch per 64 records, each after the last: each record
+            // charges the budget on its own, and the chunks must charge in
+            // lane order too. D3D12 runs the groups of one dispatch in no
+            // defined order, so a single dispatch of them charged in whatever
+            // order the scheduler picked: with 128 records the two chunks
+            // raced for the one budget word, and which records fitted
+            // differed between runs, machines and drivers. The barrier
+            // between the dispatches is what makes it lane order.
+            // `chunk[6]` is the chunk's first record.
+            let mut offset: u32 = 0;
+            while offset < records {
+                let mut chunk = constants;
+                chunk[6] = offset;
+                l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+                l.Dispatch(1, 1, 1);
+                offset += 64;
+                if offset < records {
+                    l.ResourceBarrier(&[uav_barrier()]);
+                }
+            }
         }
         l.ResourceBarrier(&second[skip..]);
     }
