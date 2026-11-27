@@ -6,6 +6,35 @@ Target: the Xbox Series build of GTA VI on Linux, through Proton.
 This repository contains no game files, code or assets. You need your own copy of the game.
 It is not affiliated with or endorsed by the game's developer or publisher.
 
+> **No longer maintained (2026-11-27).** The owner has stopped working on this project. The code stays
+> here as it was left; issues and pull requests will not be answered. Fork it freely under the licence.
+
+## Last state (2026-11-27, branch `aot-prebuild` = `gta6-linux`)
+
+Measured on Linux (Proton Experimental, RTX 3080 10 GB, view-tree wineserver patch, scripted 5-minute
+cutscene run, median of the in-world frames):
+
+| Run | Frame time | Draws per frame | GPU busy per frame |
+| --- | --- | --- | --- |
+| Base (all ports below, defaults) | 229 ms (4.4 fps) | 4,505 | 31 ms |
+| Wide card hashing off | 228 ms | 4,278 | 50 ms |
+| Texture heap worker on (`VICTORY_HEAP_WORKER=1`) | 205 / 227 ms | 3,289 / 3,438 | 28 / 26 ms |
+| Lookup cache on (`VICTORY_LOOKUP_CACHE=1`) | 226 ms | 4,209 | 42 ms |
+
+- The frame is bound by CPU-side preparation (about 130 ms) and copy-back to title memory (about 75 ms),
+  not by the GPU. About 440 draws a frame are dropped, nearly all ray-tracing work (BVH builder off).
+- The heap worker's faster run draws about 25 % fewer draws, so it is not counted as a speed-up.
+- Ported from fxceless/victory-fork (fxceless commits): heap worker d4a528b; lookup cache 32be36d + bc6ee68;
+  parallel texture checks ceb9e1f; render-target variants a35c557 (on by default); 16-bit views for the
+  mouths 58de9bf (translator part, without the clamp window); compute pipeline wait a42b627; CLZERO through
+  a faulting line b3b65aa (CPUs without CLZERO); step index 84c5dc0; plain fills de4146a; small card
+  buffers / hash length from c36971b. All switchable; see the `VICTORY_*` names in the code.
+- `VICTORY_FORGET_HEAP=0` is recommended: with the heap-identity change and released heaps forgotten, the
+  NVIDIA driver hung the GPU (Xid 109) in 3 of 3 runs.
+- Open: device losses (VK_ERROR_DEVICE_LOST, no kernel Xid) 1.5 to 2.3 minutes in, in 3 of 10 runs; some
+  faces render black up close (`VICTORY_HEAP_RECHECK=0` untested here; AnyXboxX reports it blackens faces);
+  the two water programs are refused on 32-lane hosts until the paired-wave64 translator work is ported.
+
 ## Status (2026-11-25)
 
 - Current state: close-to-console rendering. Work in progress.

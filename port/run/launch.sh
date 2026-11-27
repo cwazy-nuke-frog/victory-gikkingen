@@ -33,7 +33,11 @@ if pgrep -f '^(Z:.victory.victory[.]exe|/proton/files/bin/wine /victory/)' >/dev
 
 # The patched wineserver is mounted over Proton's, in the sandbox only:
 # it then finds share/wine/nls next to itself. Proton is not modified on disk.
-VIEWTREE=$PORT/wine/out/wineserver
+# One per Proton build: the server must speak its Wine's protocol (Experimental's build hangs under Hotfix).
+case $PROTON in
+  *"Proton Hotfix"*) VIEWTREE=${VIEWTREE:-$PORT/wine/out/wineserver-hotfix} ;;
+  *) VIEWTREE=${VIEWTREE:-$PORT/wine/out/wineserver} ;;
+esac
 WSBIND=()
 case ${WINESERVER_BIN:-auto} in
   stock) WS=stock ;;
@@ -52,7 +56,15 @@ esac
 TREE_DIR=$(cd "$TREE_DIR" && pwd)
 # Shader cache and pipeline library: one per lineage (base and matrix share the first).
 case "${TREE:-base}" in base|matrix) CACHE=cache ;; *) CACHE=cache-$TREE ;; esac
+# CACHE_TAG=name: a cache set of its own (cache-name) for a changed translator, so runs of the old
+# and new translator never share translated shaders, vkd3d pipelines or the NVIDIA cache.
+[ -n "${CACHE_TAG:-}" ] && CACHE=cache-$CACHE_TAG
+# The host caches go with the set (the base set keeps its historical paths).
+if [ "$CACHE" = cache ]; then HCACHE=; else HCACHE=-$CACHE; fi
 mkdir -p "$STATE/$CACHE"
+# vkd3d and the NVIDIA driver do not make their cache folders: a missing one means nothing is
+# kept between runs (every pipeline made again each run).
+mkdir -p "$STATE/home/.cache/vkd3d$HCACHE" "$STATE/home/.cache/nvidia$HCACHE"
 VKBIND=()
 # VKD3D=noopt : same build plus VKD3D_PIPELINE_NO_OPT (vkd3d/out/x64-noopt).
 case "${VKD3D:-stock}" in fix) VKDIR=x64 ;; noopt) VKDIR=x64-noopt ;; *) VKDIR= ;; esac
@@ -70,24 +82,43 @@ ENVV=(
   VK_LOADER_DRIVERS_SELECT='*nvidia*'
   VKD3D_CONFIG=descriptor_heap VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
   VKD3D_DEBUG=warn VKD3D_LOG_FILE="Z:\\port\\logs\\$RUN\\vkd3d.log"
-  VKD3D_SHADER_CACHE_PATH=/port/home/.cache/vkd3d
-  __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH=/port/home/.cache/nvidia
+  VKD3D_SHADER_CACHE_PATH=/port/home/.cache/vkd3d$HCACHE
+  __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH=/port/home/.cache/nvidia$HCACHE
   __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1 __GL_SHADER_DISK_CACHE_SIZE=10737418240
   VICTORY_CACHE_DIR="Z:\\port\\$CACHE" VICTORY_DATA_DIR='Z:\port\data'
   VICTORY_LOG=info VICTORY_NO_WATCHDOG=1 VICTORY_SHADER_LOOP_LIMIT=256
   VICTORY_CAPTURE="Z:\\port\\logs\\$RUN\\capture"
 )
 for kv in "$@"; do ENVV+=("$kv"); done
-printf '%s\n' "BUILD=$BUILD" "WINESERVER=$WS" "VKD3D=${VKD3D:-stock}" "TREE=${TREE:-base}" "${ENVV[@]}" | grep -vE '^(XAUTHORITY|DISPLAY|PULSE)' > "$LOG/env.txt"
+printf '%s\n' "CACHE=$CACHE" "BUILD=$BUILD" "WINESERVER=$WS" "VKD3D=${VKD3D:-stock}" "TREE=${TREE:-base}" "${ENVV[@]}" | grep -vE '^(XAUTHORITY|DISPLAY|PULSE)' > "$LOG/env.txt"
 (cd "$TREE_DIR" && git log --oneline -1 && git log --oneline --merges -10 && git --no-optional-locks status --short) > "$LOG/tree.txt"
 
 CMD=(/proton/files/bin/wine /victory/victory.exe run 'Z:\game\game_scarlett_master.exe' --execute)
+# CONSOLE=series-s: the console model the title sees (smaller targets and memory; suits a 10 GB card).
+[ -n "${CONSOLE:-}" ] && CMD+=(--console "$CONSOLE") && echo "CONSOLE=$CONSOLE" >> "$LOG/env.txt"
 [ "$LABEL" = init ] && CMD=(/proton/files/bin/wine wineboot -u)   # create the prefix, in the sandbox
 # prebuild* label: translate and build pipelines for the shader pack outside the game (source tree), JOBS threads.
 case "$LABEL" in prebuild*)
   CMD=(/proton/files/bin/wine /victory/victory.exe translate --cache --pipelines --jobs "${JOBS:-10}"
        'Z:\game\shaders.rpf' 'Z:\game\game_scarlett_master.exe' 'Z:\game\XboxBvhBuilder.dll' 'Z:\game\amd_fidelityfx_upscaler_xbox.dll')
   NEED_MB=${NEED_MB:-8000} ;;
+# aot* label: this tree's ahead-of-time pass (no --cache here): every shader translated into the
+# run's cache (--warm all), then every pipeline of the shader pack into the run's pipeline library
+# (--prebuild, the port of upstream's pre-build), JOBS threads.
+aot*)
+  AOT_ARGS="'Z:\\game\\shaders.rpf' 'Z:\\game\\game_scarlett_master.exe' 'Z:\\game\\XboxBvhBuilder.dll' 'Z:\\game\\amd_fidelityfx_upscaler_xbox.dll'"
+  CMD=(/bin/sh -c "/proton/files/bin/wine /victory/victory.exe translate --warm all --jobs ${JOBS:-10} $AOT_ARGS && /proton/files/bin/wine /victory/victory.exe translate --prebuild --jobs ${JOBS:-10} $AOT_ARGS")
+  NEED_MB=${NEED_MB:-8000} ;;
+# tr* label: one translate pass over game files, for looking at translations (no cache written
+# unless TR_OPTS asks). TR_FILES: names under Z:\game (default the BVH builder); TR_OPTS: options.
+tr*)
+  TR_PATHS=""; for f in ${TR_FILES:-XboxBvhBuilder.dll}; do TR_PATHS="$TR_PATHS 'Z:\\game\\$f'"; done
+  # TR_CMD=shader-info (with TR_OPTS=--disasm): the layout and native code instead.
+  case "${TR_CMD:-translate}" in
+    translate) CMD=(/bin/sh -c "/proton/files/bin/wine /victory/victory.exe translate ${TR_OPTS:---list} --jobs ${JOBS:-10} $TR_PATHS") ;;
+    *) CMD=(/bin/sh -c "/proton/files/bin/wine /victory/victory.exe $TR_CMD ${TR_OPTS:-} $TR_PATHS") ;;
+  esac
+  NEED_MB=${NEED_MB:-4000} ;;
 esac
 # Wine writes the registry only when the wineserver stops: wait for it (wineserver -w) before the
 # sandbox kills its processes, otherwise the prefix is left without system.reg.

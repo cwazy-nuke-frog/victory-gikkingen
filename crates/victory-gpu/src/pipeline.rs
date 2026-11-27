@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its result is replaced by the stand-in for indirect light
+    /// ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -115,6 +119,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                resolves_light: crate::ambient::resolves(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -475,10 +481,45 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`; fxceless a35c557). A draw whose views are as
+/// declared pays one comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() || no_draws() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
+/// `VICTORY_NO_DRAWS=1` (measuring only): no host pipeline is made and every
+/// draw and dispatch of the title is dropped, so the picture stays black.
+/// The title still runs its own code, streaming and memory as before; the
+/// frame time then is the ceiling no graphics work of ours can raise.
+/// (After the switch of the same name in Cold Project VI and Kelvaroq.)
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -591,7 +632,9 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
-    make::early(&host);
+    if !no_draws() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -722,32 +765,24 @@ pub(crate) extern "system" fn create_stream(
     if desc.stream.is_null() {
         return E_INVALIDARG;
     }
-    let mut shaders = Vec::new();
+    // SAFETY: the title passes a whole stream.
+    let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
+    // SAFETY: the stream's shader pointers are the title's live code.
     #[cfg(windows)]
-    let mut graphics = host::GraphicsState::default();
-    let mut at = 0;
-    while at + 8 <= desc.size {
-        // SAFETY: inside the stream the title passes.
-        let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
-        let Some((size, stage)) = subobject(kind) else {
-            tracing::warn!(
-                kind,
-                at,
-                "pipeline subobject of unknown size; the rest is ignored"
+    let (shaders, mut graphics) = unsafe { read_stream(stream, copy) };
+    #[cfg(not(windows))]
+    let shaders = unsafe { read_stream(stream, copy) };
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::integer_targets_do_not_blend`; fxceless 025b042, part
+    // of e4245f3: an invalid call that refused the pipeline).
+    #[cfg(windows)]
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
             );
-            break;
-        };
-        if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
-        }
-        #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
-        unsafe {
-            graphics.read(kind, desc.stream.add(at))
-        };
-        at += size;
+        });
     }
     hand_out(
         shaders,
@@ -756,6 +791,161 @@ pub(crate) extern "system" fn create_stream(
         iid,
         out,
     )
+}
+
+/// A creation stream's shaders (each made by `shader` from its stage and
+/// bytecode) and, on Windows, the graphics state it describes. Shared by
+/// the title's streams and the pre-build's (`Prebuild`), so that both
+/// describe a pipeline by the same code.
+///
+/// # Safety
+/// The stream's shader subobjects point at live shader code.
+unsafe fn read_stream(
+    stream: &[u8],
+    shader: impl Fn(&'static str, &Bytecode) -> Option<Arc<Shader>>,
+) -> StreamParts {
+    let mut shaders = Vec::new();
+    #[cfg(windows)]
+    let mut graphics = host::GraphicsState::default();
+    let mut at = 0;
+    while at + 8 <= stream.len() {
+        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+        let Some((size, stage)) = subobject(kind) else {
+            tracing::warn!(
+                kind,
+                at,
+                "pipeline subobject of unknown size; the rest is ignored"
+            );
+            break;
+        };
+        if at + size > stream.len() {
+            tracing::warn!(kind, at, "pipeline subobject past the stream's end; ignored");
+            break;
+        }
+        if let Some(stage) = stage {
+            // SAFETY: a shader subobject has its bytecode at +8.
+            let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
+            shaders.extend(shader(stage, code));
+        }
+        #[cfg(windows)]
+        // SAFETY: a whole subobject of this kind lies at `at`.
+        unsafe {
+            graphics.read(kind, stream.as_ptr().add(at))
+        };
+        at += size;
+    }
+    #[cfg(windows)]
+    return (shaders, graphics);
+    #[cfg(not(windows))]
+    shaders
+}
+
+#[cfg(windows)]
+type StreamParts = (Vec<Arc<Shader>>, host::GraphicsState);
+#[cfg(not(windows))]
+type StreamParts = Vec<Arc<Shader>>;
+
+/// A pipeline made ahead of a run (`translate --prebuild`): one record of
+/// the title's shader pack, turned into the creation stream the engine
+/// would hand the device (`victory_game::pipelines`) and read by the run's
+/// own code. Made, it goes into the host pipeline library the run reads,
+/// under the name its host description gives it, so a run uses it only if
+/// it would have made the very same pipeline (ported from upstream
+/// VIctory 9c58a1c, onto this tree's library).
+#[cfg(windows)]
+pub struct Prebuild {
+    shaders: Vec<Arc<Shader>>,
+    graphics: Option<Box<host::GraphicsState>>,
+}
+
+// SAFETY: as `make::Pending`: the graphics state's input elements point
+// into its own names, and it is only read.
+#[cfg(windows)]
+unsafe impl Send for Prebuild {}
+
+#[cfg(windows)]
+impl Prebuild {
+    /// A shader of its own: a pre-build must not keep every container of
+    /// the pack in the shared table, which a run keeps for good.
+    fn own(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
+        if code.code.is_null() || code.size == 0 {
+            return None;
+        }
+        // SAFETY: the caller's pointers (`graphics`).
+        let bytes = unsafe { std::slice::from_raw_parts(code.code, code.size) };
+        Some(Arc::new(Shader {
+            stage,
+            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            container: bytes.to_vec(),
+            resolves_light: false,
+            translated: OnceLock::new(),
+            walks: OnceLock::new(),
+        }))
+    }
+
+    /// The pipeline a creation stream describes, as the title passes it to
+    /// the device.
+    ///
+    /// # Safety
+    /// The stream's pointers point at live shader code and input elements.
+    pub unsafe fn graphics(stream: &[u8]) -> Prebuild {
+        // SAFETY: the caller's.
+        let (shaders, graphics) = unsafe { read_stream(stream, Self::own) };
+        Prebuild {
+            shaders,
+            graphics: Some(Box::new(graphics)),
+        }
+    }
+
+    /// The compute pipeline of a container.
+    pub fn compute(container: &[u8]) -> Prebuild {
+        let code = Bytecode {
+            code: container.as_ptr(),
+            size: container.len(),
+        };
+        Prebuild {
+            shaders: Self::own("compute", &code).into_iter().collect(),
+            graphics: None,
+        }
+    }
+
+    /// What a run lists the pipeline by (its early list).
+    pub fn key(&self) -> String {
+        make::key(&self.shaders, self.graphics.as_deref())
+    }
+
+    /// Makes the host pipeline, or finds it in the library (a second
+    /// pre-build loads what the first made); why not if it gets none.
+    pub fn make(&self) -> Result<(), String> {
+        // Without the run's log lines per shader and pipeline: tens of
+        // thousands of them would bury the pre-build's own report.
+        let quiet = tracing::Dispatch::none();
+        let made = tracing::dispatcher::with_default(&quiet, || {
+            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
+        library::save(false);
+        match made {
+            Some(_) => Ok(()),
+            None => Err(match self.shaders.iter().find(|s| matches!(s.translated.get(), Some(None))) {
+                Some(s) => format!("{} shader does not translate", s.stage),
+                None => "the host refuses it".into(),
+            }),
+        }
+    }
+}
+
+/// Host pipelines made, and loaded from the library, since the start.
+#[cfg(windows)]
+pub fn pipeline_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
+/// Whether an earlier run drew or dispatched with the title pipeline `key`
+/// (the pre-build makes those first).
+#[cfg(windows)]
+pub fn wanted_early(key: &str) -> bool {
+    library::wanted_early(key)
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {

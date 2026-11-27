@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -91,6 +93,13 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Pre-build: make every pipeline of the title's shader pack (found
+        /// among the paths, beside the shader databases) into the host
+        /// pipeline library a run reads, on this GPU and driver. Pipelines
+        /// already there are loaded, not made again. Run `--warm all` first
+        /// so the shaders are translated.
+        #[arg(long)]
+        prebuild: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,6 +169,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            prebuild,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -171,6 +181,12 @@ fn main() -> Result<()> {
             }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
+            }
+            if prebuild {
+                #[cfg(windows)]
+                return prebuild::run(paths, jobs);
+                #[cfg(not(windows))]
+                anyhow::bail!("the pre-build needs the host GPU (Windows)");
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }

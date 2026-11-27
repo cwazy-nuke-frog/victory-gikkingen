@@ -567,8 +567,102 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> GuardsHeld {
+    // Before the lock: a fault between taking it and saying so would wait
+    // for this very thread.
+    HOLDING.set(true);
+    let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    GuardsHeld(Some(g))
+}
+
+thread_local! {
+    /// Whether this thread holds [`GUARDS`] ([`guards`]).
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Blocks a write fault opened on this thread while it held the guards
+    /// ([`opened_while_held`]), for [`GuardsHeld`] to note when it lets go; and
+    /// how many.
+    static NESTED: std::cell::Cell<([usize; NESTED_MOST], usize)> = const { std::cell::Cell::new(([0; NESTED_MOST], 0)) };
+}
+
+/// Blocks one hold of the guards can have opened under it.
+const NESTED_MOST: usize = 64;
+
+/// Write faults taken while the faulting thread held the guards, and those
+/// of them past [`NESTED_MOST`] (opened, not noted).
+pub(crate) static NESTED_FAULTS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The guards, held ([`guards`]). A write fault on a guarded block while
+/// the same thread holds them, which the handler cannot wait for (the
+/// allocator under `open` wrote to one: every thread then waited on that
+/// thread, short run 3 of 2026-11-26, with the ray-tracing builder on),
+/// opens the block at once ([`opened_while_held`]); it is noted as written
+/// here before the guards are let go.
+struct GuardsHeld(Option<std::sync::MutexGuard<'static, Guards>>);
+
+impl std::ops::Deref for GuardsHeld {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.0.as_ref().expect("held")
+    }
+}
+
+impl std::ops::DerefMut for GuardsHeld {
+    fn deref_mut(&mut self) -> &mut Guards {
+        self.0.as_mut().expect("held")
+    }
+}
+
+impl Drop for GuardsHeld {
+    fn drop(&mut self) {
+        let Some(mut g) = self.0.take() else { return };
+        // Noting one may fault again: what that opens is taken in turn.
+        loop {
+            let (blocks, n) = NESTED.get();
+            if n == 0 {
+                break;
+            }
+            NESTED.set((blocks, 0));
+            for &block in &blocks[..n.min(NESTED_MOST)] {
+                open_here(&mut g, block * BLOCK, block * BLOCK + 1);
+            }
+        }
+        HOLDING.set(false);
+        drop(g);
+    }
+}
+
+/// In the write-fault handler, on a thread that holds the guards: opens
+/// the block of `at` if it is read-only (as the guards leave theirs) and
+/// notes it for [`GuardsHeld`]; whether it did. Takes no lock and allocates
+/// nothing.
+fn opened_while_held(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Protect != PAGE_READONLY {
+        return false;
+    }
+    let block = at / BLOCK;
+    let mut old = 0;
+    // SAFETY: a read-only block of committed memory; the guards made it so.
+    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    NESTED_FAULTS[0].fetch_add(1, Relaxed);
+    let (mut blocks, n) = NESTED.get();
+    if n < NESTED_MOST {
+        blocks[n] = block;
+        NESTED.set((blocks, n + 1));
+    } else {
+        NESTED_FAULTS[1].fetch_add(1, Relaxed);
+    }
+    true
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -769,6 +863,15 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
+    // The views of a page are what the runtime last noted; an address one
+    // of them had may be our own memory by now (the heap, threads' local
+    // storage): made read-only, the next write to it faulted into the
+    // handler under the guards and every thread waited (short run 4 of
+    // 2026-11-26, with the ray-tracing builder on). Only a view now.
+    if !mapped_view(block * BLOCK) {
+        STALE_ALIASES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -777,6 +880,20 @@ fn protect_alias(g: &mut Guards, block: usize) {
             g.viewed.insert(block);
         }
     }
+}
+
+/// Aliases not guarded because their address is no longer a view
+/// ([`protect_alias`]), since the start.
+pub(crate) static STALE_ALIASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `at` is committed memory of a mapped view now.
+fn mapped_view(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -801,18 +918,49 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.viewed.extend(from..to);
         }
     };
-    if set(from, to) {
-        note(g, from, to);
-        return;
-    }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+    // Region by region, and only views: under Wine one protection change
+    // takes a range across allocations (on Windows it fails and the blocks
+    // were taken one by one), and a block-sized one takes any committed
+    // page. A title buffer's range that runs past its view so made our own
+    // memory read-only after it (the heap, threads' local storage), and the
+    // first write there faulted into the handler under the guards: every
+    // thread waited (short runs 3 to 5 of 2026-11-26, with the ray-tracing
+    // builder on).
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut block = from;
+    while block < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            break;
         }
+        let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).clamp(block + 1, to);
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED {
+            if set(block, end) {
+                note(g, block, end);
+            } else {
+                for b in block..end {
+                    if set(b, b + 1) {
+                        note(g, b, b + 1);
+                    }
+                }
+            }
+        } else if matches!(info.State, MEM_RESERVE | MEM_FREE) {
+            g.absent.extend(block..end);
+        } else {
+            NOT_VIEWS.fetch_add((end - block) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        block = end;
     }
 }
+
+/// Blocks a guard's range held that were not view memory, left as they
+/// were ([`protect_here`]), since the start.
+pub(crate) static NOT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
@@ -908,10 +1056,22 @@ pub fn writing(at: usize, len: usize) {
 /// 1, the guarded blocks under it are opened and count as written (host
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
-/// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
-/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
-/// everything.
+/// 4, both also for reads to plain addresses when they have finished;
+/// 8, for reads to plain addresses the textures alone (bit 2's look).
+/// Unset: bits 1, 2 and 8. `guards`: bit 1 alone (the default until
+/// 2026-11-27 here). `0`: nothing, counted only (the default until run
+/// 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`: everything.
+///
+/// Bits 2 and 8 by default (fxceless e4245f3, gfx41: the black faces of the
+/// opening cutscene): a read makes the placed textures under it due before
+/// it begins ([`writing`]), and a texture pass can upload them while the
+/// read is under way, from memory that does not hold the bytes yet; nothing
+/// asked again once they were there. Our run short25 at that cutscene:
+/// 3,079 slots of placed textures uploaded before a DirectStorage write
+/// into their pages, "left as they were", and 115,693 reads to plain
+/// addresses finished, "counted only". Only slots uploaded before the bytes
+/// landed are made due again (`HostHeap::texture_slots_page_written`): a
+/// slot still waiting for its first upload takes the bytes there by then.
 /// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
 /// copies lay under such writes and kept the bytes from before; runs 197
 /// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
@@ -923,8 +1083,9 @@ pub(crate) fn page_writes() -> u8 {
         Ok("0") => 0,
         Ok("1") => 3,
         Ok("slots") => 2,
-        Ok("all") => 7,
-        _ => 1,
+        Ok("guards") => 1,
+        Ok("all") => 15,
+        _ => 1 | 2 | 8,
     })
 }
 
@@ -932,8 +1093,9 @@ pub(crate) fn page_writes() -> u8 {
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
 /// copies that would otherwise keep the bytes from before); reads to
-/// plain addresses that finished.
-pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// plain addresses that finished; of those, the ones passed to the texture
+/// pass (bit 8 or 4 of [`page_writes`]).
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The bytes of a write the guards do not see are there: title memory
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
@@ -961,7 +1123,13 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         WRITTEN[1].fetch_add(len as u64, Relaxed);
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
+        if mode & (4 | 8) == 0 {
+            return;
+        }
+        WRITTEN[4].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // (Bit 8 alone: the placed textures under it, not the guards.)
+            crate::descriptor::host::page_written(at, len);
             return;
         }
     }
@@ -1253,6 +1421,11 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // This thread holds the guards already (the fault is under one of
+        // our own calls): waiting for them would wait for ourselves.
+        if HOLDING.get() {
+            return if opened_while_held(at) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).

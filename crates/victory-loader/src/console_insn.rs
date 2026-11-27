@@ -97,6 +97,41 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// Zeroes the 64-byte line at `line` with ordinary stores, for a line [`writable`] refused that
+/// is committed or reserved all the same: write-protected on purpose, as the write-watch guards
+/// over the host copies of view memory make it (`watch.rs`), whose vectored handler is first in
+/// the chain and opens a guarded block for the title's own stores. The console's `clzero`
+/// faults into such a handler as any store does; here it is an illegal instruction the handler
+/// never sees, so refusing the line left that exception unhandled and ended the run (on CPUs
+/// without CLZERO: every Intel CPU). These stores fault inside this handler instead, the guard
+/// opens the block, and the stores complete. False, with nothing written, for free memory.
+/// (fxceless b3b65aa, fork #1380.)
+///
+/// # Safety
+/// The title owns the line, as it owns the line of the instruction being emulated.
+unsafe fn zero_through_fault(line: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
+    ASKED.fetch_add(1, Relaxed);
+    if !found || (m.State != MEM_COMMIT && m.State != MEM_RESERVE) {
+        return false;
+    }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, Relaxed) {
+        tracing::info!(line = format_args!("{line:#x}"), "clzero on a line that is not writable: zeroed by stores that fault into the runtime's handlers (logged once)");
+    }
+    let words = line as *mut u64;
+    for i in 0..8 {
+        // SAFETY: see the function's contract; a fault here is resolved by the runtime's
+        // handlers or ends the run, as the title's own store would.
+        unsafe { words.add(i).write_volatile(0) };
+    }
+    true
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -155,11 +190,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
-                return 0; // the real instruction faults there too
+            if writable(line, 64) {
+                // SAFETY: the 64-byte line is committed and writable.
+                unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+            } else if !unsafe { zero_through_fault(line) } {
+                return 0; // free memory: the real instruction faults there too
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
@@ -180,7 +216,16 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                     at = to;
                 }
                 if at == start {
-                    return 0;
+                    // Its first line is not writable: that line through a fault, then the
+                    // loop goes on after it.
+                    // SAFETY: the line the instruction zeroes.
+                    if !unsafe { zero_through_fault(start & !63) } {
+                        return 0;
+                    }
+                    at = (start & !63) + 64;
+                    if at >= end {
+                        at = end;
+                    }
                 }
                 ZEROED.fetch_add((at - start) as u64, Relaxed);
                 if at < end {

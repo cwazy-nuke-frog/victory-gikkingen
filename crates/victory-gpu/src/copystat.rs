@@ -755,6 +755,17 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    // Upstream VIctory #3198: textures the card had no room for are asked
+    // for again instead of staying without a host copy for the run.
+    let no_room = crate::resource::NOT_MADE_FOR_NOW.load(Relaxed);
+    if no_room > 0 {
+        tracing::info!(
+            "host textures the card had no room for when asked: {} times since the start, {} of them \
+             made on a later use",
+            no_room,
+            crate::resource::MADE_AFTER_NO_ROOM.load(Relaxed),
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -1162,7 +1173,13 @@ pub(crate) fn log(frames: f64) {
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views noted written by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views noted written by a write through another, {mapped} ranges opened because a view of them was mapped; \
+         {stale} other views left alone because their address was no longer a view; {not_views} blocks of guarded ranges that were not views left alone; {nested} write faults under the guards' own \
+         hold ({lost} of them not noted)",
+        stale = crate::watch::STALE_ALIASES.load(std::sync::atomic::Ordering::Relaxed),
+        not_views = crate::watch::NOT_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
+        nested = crate::watch::NESTED_FAULTS[0].load(std::sync::atomic::Ordering::Relaxed),
+        lost = crate::watch::NESTED_FAULTS[1].load(std::sync::atomic::Ordering::Relaxed),
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and

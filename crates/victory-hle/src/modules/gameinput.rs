@@ -1134,7 +1134,7 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+            if host_input_off() || self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
             let mut state = XINPUT_STATE::default();
@@ -1166,7 +1166,7 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            if focused() && !host_input_off() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1235,6 +1235,21 @@ mod host {
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
             .collect()
+    }
+
+    /// `VICTORY_HOST_INPUT=0`: no host pads and no host keys reach the
+    /// title, only `VICTORY_KEYS` (scripted bench runs: a controller left
+    /// plugged in, which also shows up as a keyboard, or someone at the PC,
+    /// cannot open the title's menus mid-run).
+    fn host_input_off() -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OFF.get_or_init(|| {
+            let off = std::env::var("VICTORY_HOST_INPUT").is_ok_and(|v| v.trim() == "0");
+            if off {
+                tracing::info!("host pads and keys are ignored: scripted keys only (VICTORY_HOST_INPUT=0)");
+            }
+            off
+        })
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

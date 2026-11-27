@@ -40,7 +40,7 @@ impl Source<'_> {
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     let mut out: Vec<Source<'_>> = Vec::new();
     if sgd5::is_sgd5(data) {
-        out.extend(sgd5::records(data).map(Source::Packed));
+        out.extend(sgd5::records(data).into_iter().map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
@@ -99,6 +99,21 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                // `VICTORY_DISASM_HASH=<hash>[,<hash>...]`: only the containers a
+                // run's log names by these hashes (blake3 of the container as
+                // the title passes it, its first 16 hex digits).
+                if let Ok(wanted) = std::env::var("VICTORY_DISASM_HASH") {
+                    let size = bytes
+                        .get(0x18..0x1c)
+                        .and_then(|b| b.try_into().ok())
+                        .map_or(bytes.len(), |b: [u8; 4]| u32::from_le_bytes(b) as usize)
+                        .min(bytes.len());
+                    let hash = blake3::hash(&bytes[..size]).to_hex();
+                    if !wanted.split(',').any(|w| hash.starts_with(w.trim())) {
+                        continue;
+                    }
+                    println!("== container {}", &hash[..16]);
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
